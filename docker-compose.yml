@@ -1,0 +1,154 @@
+services:
+  postgres:
+    image: postgres:${POSTGRES_IMAGE_TAG:-16-alpine}
+    container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-postgres
+    restart: unless-stopped
+    env_file:
+      - ./infra/postgres/postgres.env
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pipeline} -d ${POSTGRES_DB:-bank_market}"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    networks:
+      - data_plane
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:${CLICKHOUSE_IMAGE_TAG:-24.8}
+    container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-clickhouse
+    restart: unless-stopped
+    env_file:
+      - ./infra/clickhouse/clickhouse.env
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "${CLICKHOUSE_NATIVE_PORT:-9000}:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+      - ./infra/clickhouse/config.xml:/etc/clickhouse-server/config.d/custom-config.xml:ro
+      - ./infra/clickhouse/users.xml:/etc/clickhouse-server/users.d/custom-users.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1'"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+    networks:
+      - data_plane
+
+  airbyte:
+    image: airbyte/airbyte:${AIRBYTE_IMAGE_TAG:-latest}
+    container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-airbyte
+    restart: unless-stopped
+    env_file:
+      - ./infra/airbyte/airbyte.env
+    ports:
+      - "${AIRBYTE_PORT:-8000}:8000"
+    volumes:
+      - airbyte_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/api/v1/health >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - data_plane
+      - orchestration
+
+  airflow:
+    image: apache/airflow:${AIRFLOW_IMAGE_TAG:-2.10.2}
+    container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow
+    restart: unless-stopped
+    env_file:
+      - ./infra/airflow/airflow.env
+    user: "${AIRFLOW_UID:-50000}:0"
+    ports:
+      - "${AIRFLOW_WEBSERVER_PORT:-8080}:8080"
+    volumes:
+      - airflow_logs:/opt/airflow/logs
+      - airflow_dags:/opt/airflow/dags
+      - ./infra/airflow/airflow.cfg:/opt/airflow/airflow.cfg:ro
+    command: >
+      bash -c "
+      airflow db migrate &&
+      airflow users create
+      --username ${AIRFLOW_ADMIN_USERNAME:-admin}
+      --firstname ${AIRFLOW_ADMIN_FIRSTNAME:-Air}
+      --lastname ${AIRFLOW_ADMIN_LASTNAME:-Flow}
+      --role Admin
+      --email ${AIRFLOW_ADMIN_EMAIL:-admin@example.com}
+      --password ${AIRFLOW_ADMIN_PASSWORD:-admin} || true &&
+      airflow webserver &
+      airflow scheduler
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://localhost:8080/health | grep -q 'healthy'"]
+      interval: 20s
+      timeout: 10s
+      retries: 8
+      start_period: 60s
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - orchestration
+      - data_plane
+
+  dbt:
+    image: ghcr.io/dbt-labs/dbt-postgres:${DBT_IMAGE_TAG:-1.8.latest}
+    container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-dbt
+    restart: unless-stopped
+    env_file:
+      - ./infra/dbt/dbt.env
+    working_dir: /usr/app
+    volumes:
+      - ./:/usr/app
+      - ./infra/dbt/profiles.yml:/root/.dbt/profiles.yml:ro
+    command: ["sleep", "infinity"]
+    healthcheck:
+      test: ["CMD-SHELL", "dbt --version >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    networks:
+      - data_plane
+      - orchestration
+
+networks:
+  data_plane:
+    name: ${COMPOSE_PROJECT_NAME:-bank-market}-data-plane
+    driver: bridge
+  orchestration:
+    name: ${COMPOSE_PROJECT_NAME:-bank-market}-orchestration
+    driver: bridge
+
+volumes:
+  postgres_data:
+    name: ${COMPOSE_PROJECT_NAME:-bank-market}-postgres-data
+  clickhouse_data:
+    name: ${COMPOSE_PROJECT_NAME:-bank-market}-clickhouse-data
+  clickhouse_logs:
+    name: ${COMPOSE_PROJECT_NAME:-bank-market}-clickhouse-logs
+  airbyte_data:
+    name: ${COMPOSE_PROJECT_NAME:-bank-market}-airbyte-data
+  airflow_logs:
+    name: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow-logs
+  airflow_dags:
+    name: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow-dags
