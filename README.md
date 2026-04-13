@@ -131,7 +131,6 @@ Solo se versionan archivos de ejemplo sanitizados para mantener la seguridad del
 - `.env.example`
 - `infra/postgres/postgres.env.example`
 - `infra/clickhouse/clickhouse.env.example`
-- `infra/airbyte/airbyte.env.example`
 - `infra/airflow/airflow.env.example`
 - `infra/dbt/dbt.env.example`
 
@@ -143,7 +142,6 @@ Solo se versionan archivos de ejemplo sanitizados para mantener la seguridad del
 cp .env.example .env
 cp infra/postgres/postgres.env.example infra/postgres/postgres.env
 cp infra/clickhouse/clickhouse.env.example infra/clickhouse/clickhouse.env
-cp infra/airbyte/airbyte.env.example infra/airbyte/airbyte.env
 cp infra/airflow/airflow.env.example infra/airflow/airflow.env
 cp infra/dbt/dbt.env.example infra/dbt/dbt.env
 ```
@@ -154,12 +152,14 @@ cp infra/dbt/dbt.env.example infra/dbt/dbt.env
 Copy-Item .env.example .env
 Copy-Item infra/postgres/postgres.env.example infra/postgres/postgres.env
 Copy-Item infra/clickhouse/clickhouse.env.example infra/clickhouse/clickhouse.env
-Copy-Item infra/airbyte/airbyte.env.example infra/airbyte/airbyte.env
 Copy-Item infra/airflow/airflow.env.example infra/airflow/airflow.env
 Copy-Item infra/dbt/dbt.env.example infra/dbt/dbt.env
 ```
 
 Luego de eso, completa los valores requeridos en los archivos `.env` locales.
+
+> Opcional: si se desea implementar scripts que consumen la API de Airbyte, se puede crear `infra/airbyte/airbyte.env` desde `infra/airbyte/airbyte.env.example` para declarar endpoints de integración (`AIRBYTE_API_*`).
+
 
 ### Variables sensibles esperadas
 
@@ -186,6 +186,7 @@ No se deben subir al repositorio:
 ## Levantamiento del entorno
 
 Usa un flujo **bootstrap-script-first**. No levantes Airbyte desde `docker compose`; Airbyte se gestiona con `abctl` dentro del bootstrap.
+
 
 ## Technical Decision Record: Airbyte Local Provisioning
 
@@ -221,7 +222,6 @@ Esta decisión mejora la operación local en cuatro ejes:
 cp .env.example .env
 cp infra/postgres/postgres.env.example infra/postgres/postgres.env
 cp infra/clickhouse/clickhouse.env.example infra/clickhouse/clickhouse.env
-cp infra/airbyte/airbyte.env.example infra/airbyte/airbyte.env
 cp infra/airflow/airflow.env.example infra/airflow/airflow.env
 cp infra/dbt/dbt.env.example infra/dbt/dbt.env
 ```
@@ -246,7 +246,6 @@ bash scripts/check-health.sh
 Copy-Item .env.example .env
 Copy-Item infra/postgres/postgres.env.example infra/postgres/postgres.env
 Copy-Item infra/clickhouse/clickhouse.env.example infra/clickhouse/clickhouse.env
-Copy-Item infra/airbyte/airbyte.env.example infra/airbyte/airbyte.env
 Copy-Item infra/airflow/airflow.env.example infra/airflow/airflow.env
 Copy-Item infra/dbt/dbt.env.example infra/dbt/dbt.env
 ```
@@ -360,7 +359,7 @@ La solución está orientada a estándares de ingeniería de nivel producción, 
 - `docker-compose.yml`: orquestación principal del entorno
 - `infra/postgres/`: configuración de PostgreSQL
 - `infra/clickhouse/`: configuración de ClickHouse
-- `infra/airbyte/`: configuración de Airbyte
+- `infra/airbyte/`: plantillas opcionales para integración con la API de Airbyte
 - `infra/airflow/`: configuración de Airflow
 - `infra/dbt/`: configuración de dbt
 
@@ -371,7 +370,7 @@ El flujo ideal de ejecución para un usuario nuevo sería:
 1. Clonar el repositorio
 2. Crear los archivos `.env` a partir de los `.env.example`
 3. Completar las variables requeridas
-4. Levantar el entorno con Docker Compose
+4. Ejecutar bootstrap (`scripts/bootstrap.*`) para levantar servicios core con Compose y Airbyte con `abctl`
 5. Verificar el estado de salud de los servicios
 6. Ejecutar el pipeline
 7. Validar la carga en PostgreSQL y ClickHouse
