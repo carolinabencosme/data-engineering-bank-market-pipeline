@@ -1,0 +1,71 @@
+version: 2
+
+models:
+  - name: stg_bank_basic_info
+    description: "Modelo staging para perfiles básicos de bancos desde landing."
+    meta:
+      owner: finance_analytics
+    columns:
+      - name: symbol
+        description: "Ticker bursátil de la entidad."
+        tests:
+          - not_null
+      - name: snapshot_date
+        description: "Fecha del snapshot empresarial."
+        tests:
+          - not_null
+
+  - name: stg_stock_daily_price
+    description: "Modelo staging para precios diarios de mercado (OHLCV)."
+    meta:
+      owner: finance_analytics
+    columns:
+      - name: symbol
+        description: "Ticker bursátil de la entidad."
+        tests:
+          - not_null
+      - name: price_date
+        description: "Fecha del dato de mercado."
+        tests:
+          - not_null
+      - name: volume
+        description: "Volumen negociado."
+        tests:
+          - not_null
+
+  - name: stg_bank_fundamentals
+    description: "Modelo staging con fundamentales financieros."
+    meta:
+      owner: finance_analytics
+    columns:
+      - name: symbol
+        description: "Ticker bursátil."
+        tests:
+          - not_null
+      - name: period_type
+        description: "Granularidad temporal del indicador financiero."
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['annual', 'quarterly', 'ttm']
+
+  - name: stg_holders
+    description: "Modelo staging con posiciones de tenedores."
+    meta:
+      owner: finance_analytics
+    columns:
+      - name: holder_type
+        description: "Tipo de tenedor reportado."
+        tests:
+          - accepted_values:
+              values: ['institution', 'insider', 'mutual_fund', 'major']
+
+  - name: stg_ratings
+    description: "Modelo staging con acciones/calificaciones de analistas."
+    meta:
+      owner: finance_analytics
+    columns:
+      - name: symbol
+        description: "Ticker bursátil."
+        tests:
+          - not_null
