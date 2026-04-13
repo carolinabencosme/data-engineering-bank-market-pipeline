@@ -38,6 +38,30 @@ function Invoke-Captured {
     }
 }
 
+function Get-SummarizedOutput {
+    param(
+        [string]$Text,
+        [int]$MaxLines = 2,
+        [int]$MaxChars = 240
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return 'no output'
+    }
+
+    $singleLine = ($Text -replace "`r?`n", '; ').Trim()
+    if ($singleLine.Length -gt $MaxChars) {
+        $singleLine = "$($singleLine.Substring(0, $MaxChars))..."
+    }
+
+    $lines = $singleLine -split '; ' | Where-Object { $_.Trim() } | Select-Object -First $MaxLines
+    if (-not $lines) {
+        return 'no output'
+    }
+
+    return ($lines -join '; ')
+}
+
 function Test-ComposeServices {
     $compose = Invoke-Captured { docker compose ps --format json }
 
@@ -162,15 +186,44 @@ function Test-AirflowWebserver {
 }
 
 function Test-AirflowScheduler {
-    $result = Invoke-Captured {
-        docker compose exec -T airflow-scheduler airflow jobs check --job-type SchedulerJob --hostname "$(hostname)"
+    $maxAttempts = 4
+    $sleepSeconds = 5
+    $transientPattern = 'No alive jobs found|job.*not found|not yet started|scheduler.*starting|connection refused|timed out'
+    $lastResult = $null
+    $transientDetected = $false
+
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $lastResult = Invoke-Captured {
+            docker compose exec -T airflow-scheduler bash -lc 'scheduler_host="$(hostname)"; airflow jobs check --job-type SchedulerJob --hostname "$scheduler_host"'
+        }
+
+        if ($lastResult.ExitCode -eq 0) {
+            $detail = if ($attempt -eq 1) {
+                'scheduler responsive'
+            } else {
+                "scheduler responsive after retry $attempt/$maxAttempts"
+            }
+
+            Add-Result -Service 'airflow-scheduler' -Passed $true -Detail $detail
+            return
+        }
+
+        if ($lastResult.Output -match $transientPattern) {
+            $transientDetected = $true
+        }
+
+        if ($attempt -lt $maxAttempts) {
+            Start-Sleep -Seconds $sleepSeconds
+        }
     }
 
-    if ($result.ExitCode -eq 0) {
-        Add-Result -Service 'airflow-scheduler' -Passed $true -Detail 'scheduler responsive'
+    $summary = Get-SummarizedOutput -Text $lastResult.Output
+
+    if ($transientDetected) {
+        Add-Result -Service 'airflow-scheduler' -Passed $false -Detail "scheduler still initializing after $maxAttempts attempts (stderr: $summary)"
     }
     else {
-        Add-Result -Service 'airflow-scheduler' -Passed $false -Detail "scheduler check failed ($($result.Output -replace "`r?`n", '; '))"
+        Add-Result -Service 'airflow-scheduler' -Passed $false -Detail "scheduler check failed (stderr: $summary)"
     }
 }
 
