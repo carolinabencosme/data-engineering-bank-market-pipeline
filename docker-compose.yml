@@ -88,13 +88,13 @@ services:
       - airflow_logs:/opt/airflow/logs
       - airflow_dags:/opt/airflow/dags
       - ./infra/airflow/airflow.cfg:/opt/airflow/airflow.cfg:ro
-    command: ["airflow", "webserver"]
+    command: ["webserver"]
     healthcheck:
-      test: ["CMD-SHELL", "curl --fail http://localhost:8080/health | grep -q 'healthy'"]
-      interval: 20s
-      timeout: 10s
-      retries: 8
-      start_period: 60s
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
     depends_on:
       postgres:
         condition: service_healthy
