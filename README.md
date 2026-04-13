@@ -185,77 +185,87 @@ No se deben subir al repositorio:
 
 ## Levantamiento del entorno
 
-Aunque el stack puede levantarse completo con un solo comando, para facilitar troubleshooting se recomienda hacerlo por etapas.
+Usa un flujo **bootstrap-script-first**. No levantes Airbyte desde `docker compose`; Airbyte se gestiona con `abctl` dentro del bootstrap.
 
-### 1. Bases de datos
+### Linux / macOS
 
-```bash
-docker compose up -d postgres clickhouse
-```
+1. Crear archivos de entorno locales:
 
-### 2. Integración y orquestación
 
 ```bash
-docker compose up -d airbyte airflow
+cp .env.example .env
+cp infra/postgres/postgres.env.example infra/postgres/postgres.env
+cp infra/clickhouse/clickhouse.env.example infra/clickhouse/clickhouse.env
+cp infra/airbyte/airbyte.env.example infra/airbyte/airbyte.env
+cp infra/airflow/airflow.env.example infra/airflow/airflow.env
+cp infra/dbt/dbt.env.example infra/dbt/dbt.env
 ```
 
-### 3. Capa de transformación
+2. Ejecutar bootstrap (levanta `postgres`, `clickhouse`, `airflow`, `dbt` con Docker Compose y provisiona Airbyte con `abctl`):
 
 ```bash
-docker compose up -d dbt
+bash scripts/bootstrap.sh
 ```
 
-### 4. Todo el stack
+3. Verificar salud del entorno:
 
 ```bash
-docker compose up -d
+bash scripts/check-health.sh
 ```
 
-## Validación de salud de los servicios
+### Windows PowerShell
 
-### Estado general
+1. Crear archivos de entorno locales:
+
+```powershell
+Copy-Item .env.example .env
+Copy-Item infra/postgres/postgres.env.example infra/postgres/postgres.env
+Copy-Item infra/clickhouse/clickhouse.env.example infra/clickhouse/clickhouse.env
+Copy-Item infra/airbyte/airbyte.env.example infra/airbyte/airbyte.env
+Copy-Item infra/airflow/airflow.env.example infra/airflow/airflow.env
+Copy-Item infra/dbt/dbt.env.example infra/dbt/dbt.env
+```
+
+2. Ejecutar bootstrap:
+
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1
+```
+
+3. Verificar salud del entorno:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\check-health.ps1
+```
+
+## Verificación de salud
+
+Además de los scripts `scripts/check-health.*`, estos comandos son útiles para diagnóstico rápido:
+
+### Estado de servicios Docker Compose (stack core)
 
 ```bash
 docker compose ps
 ```
-
-### Checks por servicio
-
-#### PostgreSQL
+### Estado de Airbyte (abctl)
 
 ```bash
-docker compose exec postgres pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+abctl local status
 ```
 
-#### ClickHouse
-
-```bash
-docker compose exec clickhouse clickhouse-client --query "SELECT 1"
-```
-
-#### Airbyte
-
-```bash
-curl -fsS "http://localhost:${AIRBYTE_PORT}/api/v1/health"
-```
-
-#### Airflow
-
-```bash
-curl -fsS "http://localhost:${AIRFLOW_WEBSERVER_PORT}/health"
-```
-
-#### dbt
-
-```bash
-docker compose exec dbt dbt --version
-```
-
-Si algún servicio queda en estado `unhealthy`, revisar logs con:
+### Logs de servicios Docker Compose
 
 ```bash
 docker compose logs --tail=100 <service>
 ```
+### Logs de Airbyte (abctl)
+
+```bash
+abctl local logs
+```
+> Recomendación operativa: corre `scripts/check-health.sh` o `scripts/check-health.ps1` después de cada bootstrap y después de cualquier cambio de configuración.
+
 
 ## Flujo del pipeline
 
@@ -357,27 +367,35 @@ Este README debe complementarse con:
 
 ## Troubleshooting básico
 
-### Un servicio no levanta
-- Revisar `docker compose ps`
-- Revisar `docker compose logs --tail=100 <service>`
+### 1) `postgres` no inicia o falla healthcheck
+- Confirmar estado: `docker compose ps`
+- Ver logs: `docker compose logs --tail=100 postgres`
+- Verificar variables en `infra/postgres/postgres.env` contra el ejemplo
 
-### Error por variables de entorno
-- Verificar que todos los `.env` locales existan
-- Comparar con los archivos `.env.example`
+### 2) `clickhouse` no inicia o no responde
+- Confirmar estado: `docker compose ps`
+- Ver logs: `docker compose logs --tail=100 clickhouse`
+- Validar puerto, usuario y contraseña en `infra/clickhouse/clickhouse.env`
 
-### Error de conexión entre servicios
-- Revisar nombres de host, puertos y credenciales
-- Confirmar que los contenedores estén en ejecución
+### 3) `airflow` en restart loop o sin UI
+- Confirmar estado: `docker compose ps`
+- Ver logs: `docker compose logs --tail=100 airflow`
+- Revisar `AIRFLOW__CORE__FERNET_KEY`, `AIRFLOW__WEBSERVER__SECRET_KEY` y conexión de metadata DB
 
-### Airflow no carga correctamente
-- Revisar variables de base de datos
-- Revisar `FERNET_KEY` y `SECRET_KEY`
-- Validar configuración en `airflow.cfg`
+### 4) `dbt` falla conexión o comandos
+- Confirmar estado: `docker compose ps`
+- Ver logs: `docker compose logs --tail=100 dbt`
+- Revisar `infra/dbt/dbt.env` y `infra/dbt/profiles.yml`
 
-### dbt no conecta
-- Revisar `profiles.yml`
-- Confirmar variables `DBT_*`
-- Verificar conectividad a la base de datos de destino
+### 5) Airbyte no disponible
+- Ver estado: `abctl local status`
+- Iniciar si está detenido: `abctl local start`
+- Reinstalar/provisionar si no existe instalación local: `abctl local install`
+- Ver logs: `abctl local logs`
+
+### 6) Verificación integral falla
+- Ejecutar `bash scripts/check-health.sh` (Linux/macOS) o `powershell -ExecutionPolicy Bypass -File .\scripts\check-health.ps1` (Windows)
+- Corregir primero los checks `FAIL` y luego re-ejecutar el script
 
 ## Proyecto dbt en `dbt/`
 
