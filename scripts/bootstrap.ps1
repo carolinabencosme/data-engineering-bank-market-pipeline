@@ -216,7 +216,7 @@ function Start-CoreServices {
 function Test-AirbyteStatusHealthy {
     param([Parameter(Mandatory = $true)][string]$StatusText)
 
-    return $StatusText -match '(?i)\b(running|healthy|up|available)\b'
+    return $StatusText -match '(?i)\b(deployed|running|healthy|up|available)\b'
 }
 
 function Test-AirbyteNotInstalledMessage {
