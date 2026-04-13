@@ -42,30 +42,6 @@ services:
       start_period: 20s
     networks:
       - data_plane
-
-  airbyte:
-    image: airbyte/airbyte:${AIRBYTE_IMAGE_TAG:-latest}
-    container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-airbyte
-    restart: unless-stopped
-    env_file:
-      - ./infra/airbyte/airbyte.env
-    ports:
-      - "${AIRBYTE_PORT:-8000}:8000"
-    volumes:
-      - airbyte_data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/api/v1/health >/dev/null || exit 1"]
-      interval: 20s
-      timeout: 10s
-      retries: 10
-      start_period: 45s
-    depends_on:
-      postgres:
-        condition: service_healthy
-    networks:
-      - data_plane
-      - orchestration
-
   airflow:
     image: apache/airflow:${AIRFLOW_IMAGE_TAG:-2.10.2}
     container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow
@@ -145,9 +121,7 @@ volumes:
   clickhouse_data:
     name: ${COMPOSE_PROJECT_NAME:-bank-market}-clickhouse-data
   clickhouse_logs:
-    name: ${COMPOSE_PROJECT_NAME:-bank-market}-clickhouse-logs
-  airbyte_data:
-    name: ${COMPOSE_PROJECT_NAME:-bank-market}-airbyte-data
+    name: ${COMPOSE_PROJECT_NAME:-bank-market}-clickhouse-logs 
   airflow_logs:
     name: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow-logs
   airflow_dags:
