@@ -429,13 +429,13 @@ La solución está orientada a estándares de ingeniería de nivel producción, 
 * `infra/dbt/`: configuración de dbt
 * `dbt/`: proyecto dbt con modelos, snapshots y tests
 
-## Estado esperado de Airflow (webserver)
+## Estado esperado de Airflow
 
-Tras ejecutar bootstrap y completar `airflow-init`, el estado esperado es:
+Tras ejecutar bootstrap y completar la inicialización, el estado esperado es:
 
-* `airflow-init` finaliza en `Exited (0)` (one-shot exitoso).
-* `airflow-webserver` queda `Up` y su healthcheck en `healthy`.
-* `airflow-scheduler` queda `Up`.
+* `airflow-init`: **completado** (`Exited (0)`) como contenedor one-shot esperado.
+* `airflow-webserver`: **healthy** (`running` + healthcheck OK).
+* `airflow-scheduler`: **running**.
 * El endpoint `http://localhost:8080/health` responde HTTP 200 cuando el webserver está saludable.
 
 ## Ejecución esperada del proyecto
@@ -511,8 +511,8 @@ La imagen oficial de dbt puede traer un entrypoint que ejecuta `dbt` directament
 La solución es sobrescribir el entrypoint en `docker-compose.yml`, por ejemplo:
 
 ```yaml
-entrypoint: ["/bin/sh", "-c"]
-command: "sleep infinity"
+entrypoint: []
+command: ["sleep", "infinity"]
 ```
 
 ### 8) Airbyte no disponible
