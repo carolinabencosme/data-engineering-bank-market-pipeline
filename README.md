@@ -187,10 +187,35 @@ No se deben subir al repositorio:
 
 Usa un flujo **bootstrap-script-first**. No levantes Airbyte desde `docker compose`; Airbyte se gestiona con `abctl` dentro del bootstrap.
 
+## Technical Decision Record: Airbyte Local Provisioning
+
+### 1) `abctl` como camino soportado para despliegue local
+
+Se adopta `abctl` como ruta oficial para Airbyte local porque es el mecanismo recomendado por Airbyte para aprovisionar su stack en entornos de desarrollo de forma reproducible y alineada con su matriz de compatibilidad.
+
+`abctl` encapsula el aprovisionamiento de componentes de Airbyte, estandariza el ciclo de vida (install/start/stop/reset) y reduce drift de configuración manual respecto al modelo operativo esperado por el producto.
+
+### 2) Portabilidad preservada
+
+La portabilidad del proyecto se mantiene porque:
+
+- Los servicios core del pipeline (PostgreSQL, ClickHouse, Airflow, dbt y utilidades del proyecto) siguen definidos en Docker Compose.
+- Airbyte continúa ejecutándose en contenedores, solo que provisionados y gestionados por `abctl` en lugar de un servicio ad-hoc del `docker-compose.yml`.
+
+En otras palabras, no se pierde portabilidad: se separa la responsabilidad de orquestación local entre “core del pipeline” (Compose del repo) y “plataforma Airbyte” (`abctl`), manteniendo ambos componentes containerizados.
+
+### 4) Beneficios operativos
+
+Esta decisión mejora la operación local en cuatro ejes:
+
+- **Reproducibilidad:** `abctl` reduce variaciones de setup entre máquinas y evita configuraciones manuales frágiles para Airbyte.
+- **Compatibilidad:** el aprovisionamiento queda más cerca del camino soportado por el vendor, disminuyendo problemas por cambios de versión.
+- **Ownership boundaries más limpias:** el repositorio mantiene foco en el pipeline; Airbyte se opera con su herramienta dedicada.
+- **Maintainability:** menos lógica específica de Airbyte incrustada en Compose implica menor costo de actualización, debugging y documentación.
+
 ### Linux / macOS
 
 1. Crear archivos de entorno locales:
-
 
 ```bash
 cp .env.example .env
@@ -444,4 +469,3 @@ Las siguientes reglas quedaron declaradas en dbt para validación continua:
 - **Snapshot SCD:** `snap_dim_bank_profile` usa estrategia por `timestamp` (`ingested_at`) para preservar histórico de cambios de la dimensión de perfiles de banco.
 
 Esto permite mantener costos de procesamiento bajos en cargas recurrentes y, al mismo tiempo, conservar trazabilidad histórica para análisis temporal.
-
