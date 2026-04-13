@@ -213,18 +213,30 @@ function Start-CoreServices {
     Write-Info 'Core services started successfully.'
 }
 
+function Test-AirbyteStatusHealthy {
+    param([Parameter(Mandatory = $true)][string]$StatusText)
+
+    return $StatusText -match '(?i)\b(running|healthy|up|available)\b'
+}
+
+function Test-AirbyteNotInstalledMessage {
+    param([Parameter(Mandatory = $true)][string]$StatusText)
+
+    return $StatusText -match '(?i)not\s+found|no\s+local\s+installation|not\s+installed'
+}
+
 function Ensure-AirbyteRunning {
     Write-Info 'Checking Airbyte status with abctl...'
 
     $statusResult = Invoke-NativeCommand -FilePath 'abctl' -Arguments @('local', 'status') -AllowNonZeroExitCode
     $statusText = @($statusResult.StdOutText, $statusResult.StdErrText) -join [Environment]::NewLine
 
-    if ($statusResult.ExitCode -eq 0 -and $statusText -match '(?i)\b(running|healthy|up)\b') {
+    if ($statusResult.ExitCode -eq 0 -and (Test-AirbyteStatusHealthy -StatusText $statusText)) {
         Write-Info 'Airbyte is already running.'
         return
     }
 
-    if ($statusText -match '(?i)not\s+found|no\s+local\s+installation|not\s+installed') {
+    if (Test-AirbyteNotInstalledMessage -StatusText $statusText) {
         Write-Info 'No local Airbyte installation detected. Installing Airbyte locally...'
         $installResult = Invoke-NativeCommand -FilePath 'abctl' -Arguments @('local', 'install')
 
@@ -236,22 +248,18 @@ function Ensure-AirbyteRunning {
         return
     }
 
-    Write-Info 'Airbyte is not confirmed as running. Attempting start...'
-    $startResult = Invoke-NativeCommand -FilePath 'abctl' -Arguments @('local', 'start') -AllowNonZeroExitCode
+    Write-Info 'Airbyte appears installed but is not running. Starting Airbyte (skipping reinstall)...'
+    $startResult = Invoke-NativeCommand -FilePath 'abctl' -Arguments @('local', 'start')
 
     if ($startResult.ExitCode -eq 0) {
         Write-Info 'Airbyte started successfully.'
         return
     }
 
-    Write-WarnLog 'Airbyte start did not succeed. Attempting fresh install...'
-    $installResult = Invoke-NativeCommand -FilePath 'abctl' -Arguments @('local', 'install')
-
-    if ($installResult.ExitCode -ne 0) {
-        throw "Airbyte installation failed after start attempt.`n$(Get-CommandOutputText -Result $installResult)"
-    }
-
-    Write-Info 'Airbyte installation completed.'
+    throw (
+        "Airbyte start failed. A local installation already exists; bootstrap does not run `abctl local install` again. " +
+        "Fix the issue or run `abctl local status` / `abctl local logs` manually.`n$(Get-CommandOutputText -Result $startResult)"
+    )
 }
 
 function Invoke-HealthCheck {
@@ -273,7 +281,7 @@ function Main {
     Write-Info 'Running bootstrap preflight checks...'
 
     Test-RequiredFiles
-    
+
     Require-Command -Name 'docker' -Hint 'Install Docker and ensure it is on PATH.'
     Require-Command -Name 'abctl' -Hint 'Install Airbyte abctl and ensure it is on PATH.'
 

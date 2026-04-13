@@ -247,7 +247,7 @@ function Test-Airbyte {
 
     $result = Invoke-Captured { abctl local status }
 
-    if ($result.ExitCode -eq 0 -and $result.Output -match 'running|healthy|available|up') {
+    if ($result.ExitCode -eq 0 -and $result.Output -match '(?i)running|healthy|available|up') {
         Add-Result -Service 'airbyte' -Passed $true -Detail 'abctl local status healthy'
     }
     else {
