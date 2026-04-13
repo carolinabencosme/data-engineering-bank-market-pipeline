@@ -104,24 +104,32 @@ models:
               to: ref('dim_bank_profile')
               field: symbol
 
-  - name: agg_bank_monthly_market_summary
-    description: "Agregado mensual de precio promedio de apertura/cierre y volumen promedio."
+  - name: monthly_bank_stock_summary
+    description: "Tabla analítica mensual por símbolo con promedios de apertura/cierre y volumen."
     meta:
       owner: finance_analytics
       layer: marts
     columns:
-      - name: monthly_market_sk
-        description: "Llave sustituta del agregado mensual."
-        tests:
-          - not_null
-          - unique
       - name: symbol
         description: "Ticker de la entidad bancaria."
         tests:
+          - not_null
           - relationships:
               to: ref('dim_bank_profile')
               field: symbol
       - name: month_date
         description: "Primer día del mes resumido."
+        tests:
+          - not_null
+      - name: avg_open_price
+        description: "Promedio mensual del precio de apertura para registros válidos."
+        tests:
+          - not_null
+      - name: avg_close_price
+        description: "Promedio mensual del precio de cierre para registros válidos."
+        tests:
+          - not_null
+      - name: avg_volume
+        description: "Promedio mensual del volumen para registros válidos."
         tests:
           - not_null
