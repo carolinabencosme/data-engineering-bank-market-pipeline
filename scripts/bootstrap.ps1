@@ -157,6 +157,42 @@ function Test-DockerCompose {
     Write-Info 'Docker Compose is available.'
 }
 
+function Test-RequiredFiles {
+    Write-Info 'Validating required environment files...'
+
+    $requiredFiles = @(
+        '.env',
+        'infra/postgres/postgres.env',
+        'infra/clickhouse/clickhouse.env',
+        'infra/airflow/airflow.env',
+        'infra/dbt/dbt.env'
+    )
+
+    $missingFiles = @()
+
+    foreach ($file in $requiredFiles) {
+        $fullPath = Join-Path -Path $PSScriptRoot -ChildPath "..\$file"
+        if (-not (Test-Path -Path $fullPath -PathType Leaf)) {
+            $missingFiles += $file
+        }
+    }
+
+    if ($missingFiles.Count -gt 0) {
+        $missingList = ($missingFiles | ForEach-Object { " - $_" }) -join [Environment]::NewLine
+        $suggestedCommand = @(
+            "Copy-Item .env.example .env",
+            "Copy-Item infra/postgres/postgres.env.example infra/postgres/postgres.env",
+            "Copy-Item infra/clickhouse/clickhouse.env.example infra/clickhouse/clickhouse.env",
+            "Copy-Item infra/airflow/airflow.env.example infra/airflow/airflow.env",
+            "Copy-Item infra/dbt/dbt.env.example infra/dbt/dbt.env"
+        ) -join '; '
+
+        throw "Missing required environment file(s):`n$missingList`nCreate them from templates with:`n$suggestedCommand"
+    }
+
+    Write-Info 'All required environment files are present.'
+}
+
 function Start-CoreServices {
     Write-Info 'Starting core services (postgres, clickhouse, airflow-init, airflow-webserver, airflow-scheduler, dbt)...'
 
@@ -236,6 +272,8 @@ function Invoke-HealthCheck {
 function Main {
     Write-Info 'Running bootstrap preflight checks...'
 
+    Test-RequiredFiles
+    
     Require-Command -Name 'docker' -Hint 'Install Docker and ensure it is on PATH.'
     Require-Command -Name 'abctl' -Hint 'Install Airbyte abctl and ensure it is on PATH.'
 
