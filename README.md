@@ -379,3 +379,51 @@ Este README debe complementarse con:
 - Confirmar variables `DBT_*`
 - Verificar conectividad a la base de datos de destino
 
+## Proyecto dbt en `dbt/`
+
+Se agregó un proyecto dbt desacoplado en la carpeta `dbt/` con organización por capas:
+
+- `models/sources.yml`: fuentes de `landing` con configuración de `freshness`, descripciones, metadatos (`meta`) y owner funcional.
+- `models/staging/`: modelos `stg_*` para estandarizar datos crudos.
+- `models/marts/`: modelos analíticos orientados a OLAP (dimensiones, hechos y agregado mensual).
+- `snapshots/`: snapshot SCD para mantener histórico de cambios en dimensiones lentas.
+- `tests/`: tests custom de reglas de negocio.
+
+### Reglas de calidad de datos implementadas
+
+Las siguientes reglas quedaron declaradas en dbt para validación continua:
+
+1. **Completitud de llaves y campos críticos (`not_null`)**  
+   Se valida que llaves y fechas de negocio no lleguen nulas en `sources`, `staging` y `marts`.
+
+2. **Unicidad de entidades (`unique`)**  
+   Se valida unicidad de llaves sustitutas en hechos y agregados, y del símbolo en la dimensión maestra.
+
+3. **Dominios controlados (`accepted_values`)**  
+   Se restringen valores permitidos para campos categóricos como:
+   - `period_type`: `annual`, `quarterly`, `ttm`
+   - `holder_type`: `institution`, `insider`, `mutual_fund`, `major`
+
+4. **Integridad referencial (`relationships`)**  
+   Se valida que los hechos (`fct_*` y agregados) referencien símbolos existentes en `dim_bank_profile`.
+
+5. **Consistencia de precios OHLC (test custom)**  
+   Se valida que:
+   - `high_price >= low_price`
+   - `high_price >= max(open_price, close_price)`
+   - `low_price <= min(open_price, close_price)`
+   - `open/high/low/close >= 0`
+
+6. **Volumen no negativo (test custom)**  
+   Se valida `volume >= 0` en el hecho diario de mercado.
+
+7. **Frescura por fecha de carga (test custom + source freshness)**  
+   Se valida que la carga más reciente (`max(ingested_at)`) no supere 3 días de antigüedad, y además se configura `source freshness` con umbrales de advertencia/error.
+
+### Materializaciones y snapshots
+
+- **Incremental en marts:** hechos, dimensión principal y agregado mensual usan materialización incremental con estrategia `delete+insert`.
+- **Snapshot SCD:** `snap_dim_bank_profile` usa estrategia por `timestamp` (`ingested_at`) para preservar histórico de cambios de la dimensión de perfiles de banco.
+
+Esto permite mantener costos de procesamiento bajos en cargas recurrentes y, al mismo tiempo, conservar trazabilidad histórica para análisis temporal.
+
