@@ -1,0 +1,127 @@
+version: 2
+
+models:
+  - name: dim_bank_profile
+    description: "Dimensión maestra de bancos con el último snapshot disponible por símbolo."
+    meta:
+      owner: finance_analytics
+      layer: marts
+    columns:
+      - name: symbol
+        description: "Ticker único de la entidad bancaria."
+        tests:
+          - not_null
+          - unique
+      - name: snapshot_date
+        description: "Fecha de snapshot del último registro utilizado en la dimensión."
+        tests:
+          - not_null
+
+  - name: fct_stock_daily
+    description: "Hechos de mercado diarios (OHLCV) listos para análisis OLAP."
+    meta:
+      owner: finance_analytics
+      layer: marts
+    columns:
+      - name: stock_daily_sk
+        description: "Llave sustituta del hecho diario."
+        tests:
+          - not_null
+          - unique
+      - name: symbol
+        description: "Ticker de la entidad bancaria."
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_bank_profile')
+              field: symbol
+      - name: price_date
+        description: "Fecha de negociación."
+        tests:
+          - not_null
+
+  - name: fct_bank_fundamentals
+    description: "Hechos financieros por fecha de corte y tipo de período."
+    meta:
+      owner: finance_analytics
+      layer: marts
+    columns:
+      - name: fundamentals_sk
+        description: "Llave sustituta de fundamentales."
+        tests:
+          - not_null
+          - unique
+      - name: period_type
+        description: "Tipo de período financiero del reporte."
+        tests:
+          - accepted_values:
+              values: ['annual', 'quarterly', 'ttm']
+      - name: symbol
+        description: "Ticker de la entidad bancaria."
+        tests:
+          - relationships:
+              to: ref('dim_bank_profile')
+              field: symbol
+
+  - name: fct_holders
+    description: "Hechos de tenedores (insider/institucional/mutual fund/major)."
+    meta:
+      owner: finance_analytics
+      layer: marts
+    columns:
+      - name: holders_sk
+        description: "Llave sustituta del registro de holder."
+        tests:
+          - not_null
+          - unique
+      - name: holder_type
+        description: "Tipo de tenedor reportado."
+        tests:
+          - accepted_values:
+              values: ['institution', 'insider', 'mutual_fund', 'major']
+      - name: symbol
+        description: "Ticker de la entidad bancaria."
+        tests:
+          - relationships:
+              to: ref('dim_bank_profile')
+              field: symbol
+
+  - name: fct_ratings
+    description: "Hechos de recomendaciones y cambios de calificación de analistas."
+    meta:
+      owner: finance_analytics
+      layer: marts
+    columns:
+      - name: ratings_sk
+        description: "Llave sustituta de rating."
+        tests:
+          - not_null
+          - unique
+      - name: symbol
+        description: "Ticker de la entidad bancaria."
+        tests:
+          - relationships:
+              to: ref('dim_bank_profile')
+              field: symbol
+
+  - name: agg_bank_monthly_market_summary
+    description: "Agregado mensual de precio promedio de apertura/cierre y volumen promedio."
+    meta:
+      owner: finance_analytics
+      layer: marts
+    columns:
+      - name: monthly_market_sk
+        description: "Llave sustituta del agregado mensual."
+        tests:
+          - not_null
+          - unique
+      - name: symbol
+        description: "Ticker de la entidad bancaria."
+        tests:
+          - relationships:
+              to: ref('dim_bank_profile')
+              field: symbol
+      - name: month_date
+        description: "Primer día del mes resumido."
+        tests:
+          - not_null
