@@ -19,6 +19,7 @@ services:
       start_period: 15s
     networks:
       - data_plane
+      - orchestration
 
   clickhouse:
     image: clickhouse/clickhouse-server:${CLICKHOUSE_IMAGE_TAG:-24.8}
@@ -42,9 +43,41 @@ services:
       start_period: 20s
     networks:
       - data_plane
-  airflow:
-    image: apache/airflow:${AIRFLOW_IMAGE_TAG:-2.10.2}
-    container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow
+
+  airflow-init:
+    image: apache/airflow:${AIRFLOW_IMAGE_TAG:-2.11.2}
+    container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow-init
+    restart: "no"
+    env_file:
+      - ./infra/airflow/airflow.env
+    user: "${AIRFLOW_UID:-50000}:0"
+    volumes:
+      - airflow_logs:/opt/airflow/logs
+      - airflow_dags:/opt/airflow/dags
+      - ./infra/airflow/airflow.cfg:/opt/airflow/airflow.cfg:ro
+    entrypoint:
+      - /bin/bash
+      - -c
+    command:
+      - |
+        airflow db migrate && \
+        airflow users create \
+          --username "${AIRFLOW_ADMIN_USERNAME:-admin}" \
+          --firstname "${AIRFLOW_ADMIN_FIRSTNAME:-Air}" \
+          --lastname "${AIRFLOW_ADMIN_LASTNAME:-Flow}" \
+          --role Admin \
+          --email "${AIRFLOW_ADMIN_EMAIL:-admin@example.com}" \
+          --password "${AIRFLOW_ADMIN_PASSWORD:-admin}" || true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - orchestration
+      - data_plane
+
+  airflow-webserver:
+    image: apache/airflow:${AIRFLOW_IMAGE_TAG:-2.11.2}
+    container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow-webserver
     restart: unless-stopped
     env_file:
       - ./infra/airflow/airflow.env
@@ -55,19 +88,7 @@ services:
       - airflow_logs:/opt/airflow/logs
       - airflow_dags:/opt/airflow/dags
       - ./infra/airflow/airflow.cfg:/opt/airflow/airflow.cfg:ro
-    command: >
-      bash -c "
-      airflow db migrate &&
-      airflow users create
-      --username ${AIRFLOW_ADMIN_USERNAME:-admin}
-      --firstname ${AIRFLOW_ADMIN_FIRSTNAME:-Air}
-      --lastname ${AIRFLOW_ADMIN_LASTNAME:-Flow}
-      --role Admin
-      --email ${AIRFLOW_ADMIN_EMAIL:-admin@example.com}
-      --password ${AIRFLOW_ADMIN_PASSWORD:-admin} || true &&
-      airflow webserver &
-      airflow scheduler
-      "
+    command: ["airflow", "webserver"]
     healthcheck:
       test: ["CMD-SHELL", "curl --fail http://localhost:8080/health | grep -q 'healthy'"]
       interval: 20s
@@ -77,6 +98,29 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - orchestration
+      - data_plane
+
+  airflow-scheduler:
+    image: apache/airflow:${AIRFLOW_IMAGE_TAG:-2.11.2}
+    container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow-scheduler
+    restart: unless-stopped
+    env_file:
+      - ./infra/airflow/airflow.env
+    user: "${AIRFLOW_UID:-50000}:0"
+    volumes:
+      - airflow_logs:/opt/airflow/logs
+      - airflow_dags:/opt/airflow/dags
+      - ./infra/airflow/airflow.cfg:/opt/airflow/airflow.cfg:ro
+    command: ["airflow", "scheduler"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
     networks:
       - orchestration
       - data_plane
@@ -91,7 +135,8 @@ services:
     volumes:
       - ./:/usr/app
       - ./infra/dbt/profiles.yml:/root/.dbt/profiles.yml:ro
-    command: ["sleep", "infinity"]
+    entrypoint: ["/bin/sh", "-c"]
+    command: "sleep infinity"
     healthcheck:
       test: ["CMD-SHELL", "dbt --version >/dev/null 2>&1"]
       interval: 30s
@@ -111,6 +156,7 @@ networks:
   data_plane:
     name: ${COMPOSE_PROJECT_NAME:-bank-market}-data-plane
     driver: bridge
+
   orchestration:
     name: ${COMPOSE_PROJECT_NAME:-bank-market}-orchestration
     driver: bridge
@@ -118,11 +164,15 @@ networks:
 volumes:
   postgres_data:
     name: ${COMPOSE_PROJECT_NAME:-bank-market}-postgres-data
+
   clickhouse_data:
     name: ${COMPOSE_PROJECT_NAME:-bank-market}-clickhouse-data
+
   clickhouse_logs:
-    name: ${COMPOSE_PROJECT_NAME:-bank-market}-clickhouse-logs 
+    name: ${COMPOSE_PROJECT_NAME:-bank-market}-clickhouse-logs
+
   airflow_logs:
     name: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow-logs
+
   airflow_dags:
     name: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow-dags
