@@ -135,8 +135,8 @@ services:
     volumes:
       - ./:/usr/app
       - ./infra/dbt/profiles.yml:/root/.dbt/profiles.yml:ro
-    entrypoint: ["/bin/sh", "-c"]
-    command: "sleep infinity"
+    entrypoint: []
+    command: ["sleep", "infinity"]
     healthcheck:
       test: ["CMD-SHELL", "dbt --version >/dev/null 2>&1"]
       interval: 30s
