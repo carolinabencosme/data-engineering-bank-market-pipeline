@@ -429,6 +429,15 @@ La solución está orientada a estándares de ingeniería de nivel producción, 
 * `infra/dbt/`: configuración de dbt
 * `dbt/`: proyecto dbt con modelos, snapshots y tests
 
+## Estado esperado de Airflow (webserver)
+
+Tras ejecutar bootstrap y completar `airflow-init`, el estado esperado es:
+
+* `airflow-init` finaliza en `Exited (0)` (one-shot exitoso).
+* `airflow-webserver` queda `Up` y su healthcheck en `healthy`.
+* `airflow-scheduler` queda `Up`.
+* El endpoint `http://localhost:8080/health` responde HTTP 200 cuando el webserver está saludable.
+
 ## Ejecución esperada del proyecto
 
 El flujo ideal de ejecución para un usuario nuevo sería:
