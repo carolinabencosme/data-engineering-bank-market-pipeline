@@ -3,7 +3,9 @@ $ErrorActionPreference = 'Stop'
 
 $Summary = New-Object System.Collections.Generic.List[object]
 $CriticalFailures = 0
-$ExpectedServices = @('postgres', 'clickhouse', 'airflow', 'dbt')
+
+# Servicios que sí deben permanecer corriendo
+$ExpectedRunningServices = @('postgres', 'clickhouse', 'airflow-webserver', 'airflow-scheduler', 'dbt')
 
 function Add-Result {
     param(
@@ -15,8 +17,8 @@ function Add-Result {
     $status = if ($Passed) { 'PASS' } else { 'FAIL' }
     $Summary.Add([PSCustomObject]@{
         Service = $Service
-        Check = $status
-        Detail = $Detail
+        Check   = $status
+        Detail  = $Detail
     })
 
     if (-not $Passed) {
@@ -32,7 +34,7 @@ function Invoke-Captured {
 
     [PSCustomObject]@{
         ExitCode = if ($null -eq $exitCode) { 0 } else { $exitCode }
-        Output = ($output | Out-String).Trim()
+        Output   = ($output | Out-String).Trim()
     }
 }
 
@@ -46,6 +48,7 @@ function Test-ComposeServices {
 
     $serviceRows = $compose.Output -split "`r?`n" | Where-Object { $_.Trim() }
     $records = @()
+
     foreach ($row in $serviceRows) {
         try {
             $records += $row | ConvertFrom-Json
@@ -59,15 +62,16 @@ function Test-ComposeServices {
     $missing = New-Object System.Collections.Generic.List[string]
     $notRunning = New-Object System.Collections.Generic.List[string]
 
-    foreach ($svc in $ExpectedServices) {
+    foreach ($svc in $ExpectedRunningServices) {
         $record = $records | Where-Object { $_.Service -eq $svc } | Select-Object -First 1
+
         if (-not $record) {
             $missing.Add($svc)
             continue
         }
 
         if ($record.State -ne 'running') {
-            $notRunning.Add($svc)
+            $notRunning.Add("$svc=$($record.State)")
         }
     }
 
@@ -79,11 +83,51 @@ function Test-ComposeServices {
         return
     }
 
-    Add-Result -Service 'compose' -Passed $true -Detail 'expected services are running'
+    Add-Result -Service 'compose' -Passed $true -Detail 'expected running services are present'
+}
+
+function Test-AirflowInit {
+    $compose = Invoke-Captured { docker compose ps --format json }
+
+    if ($compose.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($compose.Output)) {
+        Add-Result -Service 'airflow-init' -Passed $false -Detail 'Unable to inspect airflow-init status'
+        return
+    }
+
+    $serviceRows = $compose.Output -split "`r?`n" | Where-Object { $_.Trim() }
+    $records = @()
+
+    foreach ($row in $serviceRows) {
+        try {
+            $records += $row | ConvertFrom-Json
+        }
+        catch {
+            Add-Result -Service 'airflow-init' -Passed $false -Detail 'Invalid docker compose ps JSON output'
+            return
+        }
+    }
+
+    $record = $records | Where-Object { $_.Service -eq 'airflow-init' } | Select-Object -First 1
+
+    if (-not $record) {
+        Add-Result -Service 'airflow-init' -Passed $false -Detail 'service not found'
+        return
+    }
+
+    if ($record.State -match 'exited|stopped') {
+        Add-Result -Service 'airflow-init' -Passed $true -Detail "completed with state $($record.State)"
+    }
+    elseif ($record.State -eq 'running') {
+        Add-Result -Service 'airflow-init' -Passed $true -Detail 'still running (may still be initializing)'
+    }
+    else {
+        Add-Result -Service 'airflow-init' -Passed $false -Detail "unexpected state: $($record.State)"
+    }
 }
 
 function Test-PostgresReady {
     $result = Invoke-Captured { docker compose exec -T postgres pg_isready }
+
     if ($result.ExitCode -eq 0) {
         Add-Result -Service 'postgres' -Passed $true -Detail 'pg_isready ok'
     }
@@ -104,14 +148,29 @@ function Test-ClickHouse {
     }
 }
 
-function Test-Airflow {
-    $result = Invoke-Captured { docker compose exec -T airflow curl --silent --show-error --fail http://localhost:8080/health }
+function Test-AirflowWebserver {
+    $result = Invoke-Captured {
+        docker compose exec -T airflow-webserver curl --silent --show-error --fail http://localhost:8080/health
+    }
 
     if ($result.ExitCode -eq 0 -and $result.Output -match 'healthy') {
-        Add-Result -Service 'airflow' -Passed $true -Detail 'health endpoint healthy'
+        Add-Result -Service 'airflow-webserver' -Passed $true -Detail 'health endpoint healthy'
     }
     else {
-        Add-Result -Service 'airflow' -Passed $false -Detail 'health endpoint failed'
+        Add-Result -Service 'airflow-webserver' -Passed $false -Detail "health endpoint failed ($($result.Output -replace "`r?`n", '; '))"
+    }
+}
+
+function Test-AirflowScheduler {
+    $result = Invoke-Captured {
+        docker compose exec -T airflow-scheduler airflow jobs check --job-type SchedulerJob --hostname "$(hostname)"
+    }
+
+    if ($result.ExitCode -eq 0) {
+        Add-Result -Service 'airflow-scheduler' -Passed $true -Detail 'scheduler responsive'
+    }
+    else {
+        Add-Result -Service 'airflow-scheduler' -Passed $false -Detail "scheduler check failed ($($result.Output -replace "`r?`n", '; '))"
     }
 }
 
@@ -120,7 +179,7 @@ function Test-Dbt {
     $headline = ($result.Output -split "`r?`n" | Select-Object -First 1)
 
     if ($result.ExitCode -eq 0) {
-        Add-Result -Service 'dbt' -Passed $true -Detail ($headline ?? 'dbt available')
+        Add-Result -Service 'dbt' -Passed $true -Detail $(if ($headline) { $headline } else { 'dbt available' })
     }
     else {
         Add-Result -Service 'dbt' -Passed $false -Detail 'dbt --version failed'
@@ -144,9 +203,11 @@ function Test-Airbyte {
 }
 
 Test-ComposeServices
+Test-AirflowInit
 Test-PostgresReady
 Test-ClickHouse
-Test-Airflow
+Test-AirflowWebserver
+Test-AirflowScheduler
 Test-Dbt
 Test-Airbyte
 
