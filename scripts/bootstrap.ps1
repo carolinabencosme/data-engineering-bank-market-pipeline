@@ -3,10 +3,17 @@ $ErrorActionPreference = 'Stop'
 
 function Write-Log {
     param(
-        [Parameter(Mandatory = $true)][string]$Level,
+        [Parameter(Mandatory = $true)][ValidateSet('INFO', 'WARN', 'ERROR')][string]$Level,
         [Parameter(Mandatory = $true)][string]$Message
     )
-    Write-Host "[$Level] $Message"
+
+    $color = switch ($Level) {
+        'INFO'  { 'Cyan' }
+        'WARN'  { 'Yellow' }
+        'ERROR' { 'Red' }
+    }
+
+    Write-Host "[$Level] $Message" -ForegroundColor $color
 }
 
 function Write-Info {
@@ -14,9 +21,14 @@ function Write-Info {
     Write-Log -Level 'INFO' -Message $Message
 }
 
+function Write-WarnLog {
+    param([Parameter(Mandatory = $true)][string]$Message)
+    Write-Log -Level 'WARN' -Message $Message
+}
+
 function Write-ErrorLog {
     param([Parameter(Mandatory = $true)][string]$Message)
-    Write-Error "[ERROR] $Message"
+    Write-Log -Level 'ERROR' -Message $Message
 }
 
 function Require-Command {
@@ -26,88 +38,212 @@ function Require-Command {
     )
 
     if (-not (Get-Command -Name $Name -ErrorAction SilentlyContinue)) {
-        Write-ErrorLog "Missing required command: $Name"
+        $message = "Missing required command: $Name"
         if ($Hint) {
-            Write-ErrorLog $Hint
+            $message = "$message. $Hint"
         }
-        throw "Missing command: $Name"
+        throw $message
     }
+}
+
+function ConvertTo-ArgumentString {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
+
+    $escaped = foreach ($arg in $Arguments) {
+        if ($arg -match '[\s"]') {
+            '"' + ($arg -replace '"', '\"') + '"'
+        }
+        else {
+            $arg
+        }
+    }
+
+    return ($escaped -join ' ')
+}
+
+function Invoke-NativeCommand {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter()][string[]]$Arguments = @(),
+        [switch]$AllowNonZeroExitCode
+    )
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    $psi.Arguments = ConvertTo-ArgumentString -Arguments $Arguments
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $psi
+
+    try {
+        [void]$process.Start()
+
+        $stdOut = $process.StandardOutput.ReadToEnd()
+        $stdErr = $process.StandardError.ReadToEnd()
+
+        $process.WaitForExit()
+
+        $stdoutLines = @()
+        if (-not [string]::IsNullOrWhiteSpace($stdOut)) {
+            $stdoutLines = @($stdOut -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        }
+
+        $stderrLines = @()
+        if (-not [string]::IsNullOrWhiteSpace($stdErr)) {
+            $stderrLines = @($stdErr -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        }
+
+        return [PSCustomObject]@{
+            ExitCode    = $process.ExitCode
+            StdOutLines = $stdoutLines
+            StdErrLines = $stderrLines
+            StdOutText  = ($stdoutLines -join [Environment]::NewLine)
+            StdErrText  = ($stderrLines -join [Environment]::NewLine)
+            Success     = ($process.ExitCode -eq 0 -or $AllowNonZeroExitCode.IsPresent)
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
+function Get-CommandOutputText {
+    param(
+        [Parameter(Mandatory = $true)]$Result
+    )
+
+    $details = @()
+    if ($Result.StdOutText) { $details += $Result.StdOutText }
+    if ($Result.StdErrText) { $details += $Result.StdErrText }
+
+    if ($details.Count -gt 0) {
+        return ($details -join [Environment]::NewLine)
+    }
+
+    return 'No additional details were returned.'
 }
 
 function Test-DockerDaemon {
-    docker info *> $null
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Docker daemon is not reachable. Ensure Docker Desktop/Engine is running.'
+    Write-Info 'Checking Docker daemon availability...'
+
+    $result = Invoke-NativeCommand -FilePath 'docker' -Arguments @('info')
+
+    if ($result.ExitCode -ne 0) {
+        throw "Docker daemon is not reachable. Ensure Docker Desktop/Engine is running.`n$(Get-CommandOutputText -Result $result)"
     }
+
+    foreach ($warning in $result.StdErrLines) {
+        Write-WarnLog $warning
+    }
+
+    Write-Info 'Docker daemon is reachable.'
 }
 
 function Test-DockerCompose {
-    docker compose version *> $null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Docker Compose v2 is not available via 'docker compose'."
+    Write-Info 'Checking Docker Compose availability...'
+
+    $result = Invoke-NativeCommand -FilePath 'docker' -Arguments @('compose', 'version')
+
+    if ($result.ExitCode -ne 0) {
+        throw "Docker Compose v2 is not available via 'docker compose'.`n$(Get-CommandOutputText -Result $result)"
     }
+
+    Write-Info 'Docker Compose is available.'
+}
+
+function Start-CoreServices {
+    Write-Info 'Starting core services (postgres, clickhouse, airflow-init, airflow-webserver, airflow-scheduler, dbt)...'
+
+    $result = Invoke-NativeCommand -FilePath 'docker' -Arguments @(
+        'compose', 'up', '-d',
+        'postgres',
+        'clickhouse',
+        'airflow-init',
+        'airflow-webserver',
+        'airflow-scheduler',
+        'dbt'
+    )
+
+    if ($result.ExitCode -ne 0) {
+        throw "Failed to start core services with Docker Compose.`n$(Get-CommandOutputText -Result $result)"
+    }
+
+    Write-Info 'Core services started successfully.'
+}
+
+function Ensure-AirbyteRunning {
+    Write-Info 'Checking Airbyte status with abctl...'
+
+    $statusResult = Invoke-NativeCommand -FilePath 'abctl' -Arguments @('local', 'status') -AllowNonZeroExitCode
+    $statusText = @($statusResult.StdOutText, $statusResult.StdErrText) -join [Environment]::NewLine
+
+    if ($statusResult.ExitCode -eq 0 -and $statusText -match '(?i)\b(running|healthy|up)\b') {
+        Write-Info 'Airbyte is already running.'
+        return
+    }
+
+    if ($statusText -match '(?i)not\s+found|no\s+local\s+installation|not\s+installed') {
+        Write-Info 'No local Airbyte installation detected. Installing Airbyte locally...'
+        $installResult = Invoke-NativeCommand -FilePath 'abctl' -Arguments @('local', 'install')
+
+        if ($installResult.ExitCode -ne 0) {
+            throw "Airbyte installation failed.`n$(Get-CommandOutputText -Result $installResult)"
+        }
+
+        Write-Info 'Airbyte installation completed.'
+        return
+    }
+
+    Write-Info 'Airbyte is not confirmed as running. Attempting start...'
+    $startResult = Invoke-NativeCommand -FilePath 'abctl' -Arguments @('local', 'start') -AllowNonZeroExitCode
+
+    if ($startResult.ExitCode -eq 0) {
+        Write-Info 'Airbyte started successfully.'
+        return
+    }
+
+    Write-WarnLog 'Airbyte start did not succeed. Attempting fresh install...'
+    $installResult = Invoke-NativeCommand -FilePath 'abctl' -Arguments @('local', 'install')
+
+    if ($installResult.ExitCode -ne 0) {
+        throw "Airbyte installation failed after start attempt.`n$(Get-CommandOutputText -Result $installResult)"
+    }
+
+    Write-Info 'Airbyte installation completed.'
 }
 
 function Invoke-HealthCheck {
-    $healthScript = Join-Path -Path $PSScriptRoot -ChildPath 'health-check.ps1'
+    $healthScript = Join-Path -Path $PSScriptRoot -ChildPath 'check-health.ps1'
 
     if (-not (Test-Path -Path $healthScript)) {
         throw "Health-check script not found at $healthScript"
     }
 
     Write-Info 'Running health-check script...'
-    & $healthScript
-}
+    & powershell -ExecutionPolicy Bypass -File $healthScript
 
-function Ensure-AirbyteRunning {
-    Write-Info 'Checking Airbyte status with abctl...'
-
-    $statusOutput = & abctl local status 2>&1
-    $statusExit = $LASTEXITCODE
-
-    if ($statusExit -eq 0) {
-        $statusText = ($statusOutput | Out-String)
-        if ($statusText -match 'running|healthy|up') {
-            Write-Info 'Airbyte is already running.'
-            return
-        }
-
-        Write-Info 'Airbyte appears installed but not running. Starting Airbyte...'
-        & abctl local start
-        return
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Health-check script reported a failure.'
     }
-
-    $statusText = ($statusOutput | Out-String)
-    if ($statusText -match 'not\s+found|no\s+local\s+installation|not\s+installed') {
-        Write-Info 'No local Airbyte installation detected. Creating Airbyte local installation...'
-        & abctl local install
-        return
-    }
-
-    Write-Info 'Unable to confirm Airbyte status; attempting idempotent start before install.'
-    & abctl local start *> $null
-    if ($LASTEXITCODE -eq 0) {
-        Write-Info 'Airbyte start succeeded.'
-        return
-    }
-
-    Write-Info 'Airbyte start failed; attempting install.'
-    & abctl local install
 }
 
 function Main {
     Write-Info 'Running bootstrap preflight checks...'
 
     Require-Command -Name 'docker' -Hint 'Install Docker and ensure it is on PATH.'
-    Test-DockerDaemon
-    Test-DockerCompose
     Require-Command -Name 'abctl' -Hint 'Install Airbyte abctl and ensure it is on PATH.'
 
-    Write-Info 'Starting core services (postgres, clickhouse, airflow, dbt)...'
-    & docker compose up -d postgres clickhouse airflow dbt
+    Test-DockerDaemon
+    Test-DockerCompose
 
+    Start-CoreServices
     Ensure-AirbyteRunning
-
     Invoke-HealthCheck
 
     Write-Info 'Bootstrap completed successfully.'
