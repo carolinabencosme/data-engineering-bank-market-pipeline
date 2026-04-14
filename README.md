@@ -119,6 +119,7 @@ La arquitectura del proyecto separa claramente las responsabilidades del flujo d
 │   ├── clickhouse/
 │   ├── dbt/
 │   └── postgres/
+│       └── init/
 ├── scripts/
 │   ├── bootstrap.sh
 │   ├── bootstrap.ps1
@@ -168,7 +169,7 @@ Copy-Item infra/airflow/airflow.env.example infra/airflow/airflow.env
 Copy-Item infra/dbt/dbt.env.example infra/dbt/dbt.env
 ```
 
-Luego de eso, completa los valores requeridos en los archivos `.env` locales.
+Luego de eso, completa los valores requeridos en los archivos `.env` locales. **El `.env` en la raíz del repositorio es la fuente principal de variables para Docker Compose** (incluido Postgres, Airflow, ClickHouse y dbt); los archivos bajo `infra/*/*.env` sirven como overrides opcionales. Los scripts de bootstrap validan explícitamente claves críticas en el `.env` raíz (por ejemplo `POSTGRES_*`, `AIRFLOW_DB_*` y `AIRFLOW__DATABASE__SQL_ALCHEMY_CONN`).
 
 > Opcional: si se desea implementar scripts que consumen la API de Airbyte, se puede crear `infra/airbyte/airbyte.env` desde `infra/airbyte/airbyte.env.example` para declarar endpoints de integración (`AIRBYTE_API_*`).
 
@@ -224,6 +225,34 @@ No se deben subir al repositorio:
 * API keys
 * credenciales reales
 * configuraciones sensibles locales
+
+## PostgreSQL: datos del pipeline y metadata de Airflow
+
+En el **mismo** servidor PostgreSQL conviven dos bases lógicas distintas:
+
+* **`POSTGRES_DB` (por defecto `bank_market`)**: landing zone y datos operativos del pipeline; usuario **`POSTGRES_USER`** (por defecto `pipeline`).
+* **`AIRFLOW_DB_NAME` (por defecto `airflow`)**: metadata interna de Airflow; usuario **`AIRFLOW_DB_USER`** (por defecto `airflow`).
+
+La cadena `AIRFLOW__DATABASE__SQL_ALCHEMY_CONN` del `.env` debe apuntar a la base de metadata (`AIRFLOW_DB_NAME`) con el usuario `AIRFLOW_DB_USER`. No se reutiliza `bank_market` para metadata de Airflow.
+
+En el primer arranque con un volumen de datos **vacío**, los scripts montados en `infra/postgres/init/` (por ejemplo `10-create-airflow-metadata.sh`) crean automáticamente el rol y la base de Airflow. El SQL usa literales interpolados desde el shell (escapando comillas simples), porque las variables de cliente `psql` del tipo `:'nombre` **no** son sustituibles de forma fiable dentro de bloques `DO ... $$` enviados al servidor. Además, **`CREATE DATABASE` no puede ejecutarse dentro de un `DO`**; el script crea el rol en un `DO` y la base con sentencias de nivel superior (incl. `\gexec` en `psql`). El script usa **POSIX `sh`** (sin bashismos como `[[`) para que sea válido también cuando la imagen de Postgres lo **carga con `. script`** en lugar de ejecutarlo (puede ocurrir en Windows si el bind mount no conserva el bit ejecutable).
+
+**Importante en Windows:** los scripts bajo `infra/postgres/init/` deben guardarse con finales de línea **LF** (Unix). Si el archivo tiene **CRLF**, el contenedor falla con `bad interpreter: No such file or directory` (aparece como `/bin/sh^M`). El repositorio incluye `.gitattributes` para forzar LF en esos paths; tras clonar o cambiar `core.autocrlf`, ejecuta `git add --renormalize .` y vuelve a crear el volumen de Postgres (`docker compose down -v`). **Docker Compose carga primero el `.env` del raíz del repo** y fusiona `infra/postgres/postgres.env` para overrides opcionales.
+
+### Reinicialización obligatoria del volumen de Postgres
+
+Los archivos bajo `/docker-entrypoint-initdb.d` **solo se ejecutan cuando el volumen de datos de Postgres se crea por primera vez**. Si ya tenías un volumen previo sin el rol/base de Airflow, debes **eliminar el volumen** y volver a levantar los servicios para que se apliquen los scripts de inicialización.
+
+En PowerShell, desde la raíz del repositorio:
+
+```powershell
+docker compose down -v
+docker compose up -d
+```
+
+Sin `docker compose down -v` (o sin borrar el volumen nombrado de Postgres), los scripts de init **no** volverán a ejecutarse y seguirás con el estado antiguo del cluster.
+
+Tras recrear el volumen, vuelve a ejecutar `scripts/bootstrap.*` para validar conectividad (`bank_market` con `pipeline`, base `airflow` con `airflow`, `airflow db check`, etc.).
 
 ## Levantamiento del entorno
 
@@ -491,6 +520,7 @@ Este README debe complementarse con:
 * Ver logs: `docker compose logs --tail=100 airflow-init`
 * Confirmar conectividad con PostgreSQL
 * Validar variables de admin y cadena `AIRFLOW__DATABASE__SQL_ALCHEMY_CONN`
+* Confirmar que existen la base `AIRFLOW_DB_NAME` y el rol `AIRFLOW_DB_USER` (se crean en el primer arranque con volumen vacío vía `infra/postgres/init/`). Si el volumen de Postgres es antiguo, recrea el volumen: `docker compose down -v` y vuelve a levantar.
 
 ### 5) `airflow-scheduler` no arranca
 
