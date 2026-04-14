@@ -29,12 +29,40 @@ function Add-Result {
 function Invoke-Captured {
     param([Parameter(Mandatory = $true)][scriptblock]$Action)
 
-    $output = & $Action 2>&1
-    $exitCode = $LASTEXITCODE
+    $previousEap = $ErrorActionPreference
+    $hasNativePreference = $null -ne (Get-Variable -Name PSNativeCommandUseErrorActionPreference -Scope Global -ErrorAction SilentlyContinue)
 
-    [PSCustomObject]@{
-        ExitCode = if ($null -eq $exitCode) { 0 } else { $exitCode }
-        Output   = ($output | Out-String).Trim()
+    if ($hasNativePreference) {
+        $previousNative = $global:PSNativeCommandUseErrorActionPreference
+    }
+
+    try {
+        $ErrorActionPreference = 'Continue'
+
+        if ($hasNativePreference) {
+            $global:PSNativeCommandUseErrorActionPreference = $false
+        }
+
+        $output = & $Action 2>&1
+        $exitCode = $LASTEXITCODE
+
+        return [PSCustomObject]@{
+            ExitCode = if ($null -eq $exitCode) { 0 } else { $exitCode }
+            Output   = ($output | Out-String).Trim()
+        }
+    }
+    catch {
+        return [PSCustomObject]@{
+            ExitCode = if ($null -eq $LASTEXITCODE) { 1 } else { $LASTEXITCODE }
+            Output   = ($_ | Out-String).Trim()
+        }
+    }
+    finally {
+        $ErrorActionPreference = $previousEap
+
+        if ($hasNativePreference) {
+            $global:PSNativeCommandUseErrorActionPreference = $previousNative
+        }
     }
 }
 
@@ -63,7 +91,7 @@ function Get-SummarizedOutput {
 }
 
 function Test-ComposeServices {
-    $compose = Invoke-Captured { docker compose ps --format json }
+    $compose = Invoke-Captured { docker compose ps --all --format json }
 
     if ($compose.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($compose.Output)) {
         Add-Result -Service 'compose' -Passed $false -Detail 'Unable to read docker compose ps output'
@@ -111,7 +139,7 @@ function Test-ComposeServices {
 }
 
 function Test-AirflowInit {
-    $compose = Invoke-Captured { docker compose ps --format json }
+    $compose = Invoke-Captured { docker compose ps --all --format json }
 
     if ($compose.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($compose.Output)) {
         Add-Result -Service 'airflow-init' -Passed $false -Detail 'Unable to inspect airflow-init status'
@@ -189,6 +217,7 @@ function Test-AirflowScheduler {
     $maxAttempts = 4
     $sleepSeconds = 5
     $transientPattern = 'No alive jobs found|job.*not found|not yet started|scheduler.*starting|connection refused|timed out'
+    $successPattern = 'Found one alive job|Found [0-9]+ alive job'
     $lastResult = $null
     $transientDetected = $false
 
@@ -197,7 +226,7 @@ function Test-AirflowScheduler {
             docker compose exec -T airflow-scheduler bash -lc 'scheduler_host="$(hostname)"; airflow jobs check --job-type SchedulerJob --hostname "$scheduler_host"'
         }
 
-        if ($lastResult.ExitCode -eq 0) {
+        if ($lastResult.ExitCode -eq 0 -and $lastResult.Output -match $successPattern) {
             $detail = if ($attempt -eq 1) {
                 'scheduler responsive'
             } else {
@@ -269,3 +298,5 @@ $Summary | Format-Table -AutoSize
 if ($CriticalFailures -gt 0) {
     exit 1
 }
+
+exit 0
