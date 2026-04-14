@@ -1,0 +1,3 @@
+# Linux containers (Postgres init, etc.): CRLF breaks shebangs (#!/bin/sh^M).
+infra/postgres/init/** text eol=lf
+scripts/*.sh text eol=lf
