@@ -157,6 +157,310 @@ function Test-DockerCompose {
     Write-Info 'Docker Compose is available.'
 }
 
+function Get-RepoRoot {
+    return (Resolve-Path -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath '..')).Path
+}
+
+function Get-DotEnvVariables {
+    param(
+        [Parameter(Mandatory = $true)][string]$LiteralPath
+    )
+
+    $result = @{}
+
+    foreach ($rawLine in Get-Content -LiteralPath $LiteralPath) {
+        $line = $rawLine.Trim()
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('#')) {
+            continue
+        }
+
+        $idx = $line.IndexOf('=')
+        if ($idx -lt 1) {
+            continue
+        }
+
+        $key = $line.Substring(0, $idx).Trim()
+        $val = $line.Substring($idx + 1).Trim()
+
+        if (($val.Length -ge 2) -and (($val.StartsWith('"') -and $val.EndsWith('"')) -or ($val.StartsWith("'") -and $val.EndsWith("'")))) {
+            $val = $val.Substring(1, $val.Length - 2)
+        }
+
+        $result[$key] = $val
+    }
+
+    return $result
+}
+
+function Assert-RequiredDotEnvKeys {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$EnvVars
+    )
+
+    $required = @(
+        'POSTGRES_USER',
+        'POSTGRES_DB',
+        'POSTGRES_PASSWORD',
+        'AIRFLOW_DB_USER',
+        'AIRFLOW_DB_PASSWORD',
+        'AIRFLOW_DB_NAME',
+        'AIRFLOW__DATABASE__SQL_ALCHEMY_CONN'
+    )
+
+    $missing = @()
+    foreach ($key in $required) {
+        if (-not $EnvVars.ContainsKey($key) -or [string]::IsNullOrWhiteSpace([string]$EnvVars[$key])) {
+            $missing += $key
+        }
+    }
+
+    if ($missing.Count -gt 0) {
+        throw "Missing or empty required keys in .env: $($missing -join ', '). Fill them using .env.example as a guide."
+    }
+}
+
+function Invoke-DockerCompose {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [switch]$AllowNonZeroExitCode
+    )
+
+    return (Invoke-NativeCommand -FilePath 'docker' -Arguments (@('compose') + $Arguments) -AllowNonZeroExitCode:$AllowNonZeroExitCode)
+}
+
+function Wait-PostgresReady {
+    param(
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+    )
+
+    Write-Info "Waiting for Postgres to accept connections (timeout ${TimeoutSeconds}s)..."
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $result = Invoke-DockerCompose -Arguments @(
+            'exec', '-T', 'postgres', 'bash', '-lc',
+            'export PGPASSWORD="${POSTGRES_PASSWORD?}"; pg_isready -h 127.0.0.1 -U "${POSTGRES_USER?}" -d "${POSTGRES_DB?}"'
+        ) -AllowNonZeroExitCode
+        if ($result.ExitCode -eq 0) {
+            Write-Info 'Postgres is accepting connections.'
+            return
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    throw (
+        "Postgres did not become reachable within ${TimeoutSeconds}s.`n" +
+        "Check: docker compose ps postgres`n" +
+        "Logs: docker compose logs --tail=200 postgres"
+    )
+}
+
+function Test-PostgresPipelineRole {
+    Write-Info 'Validating pipeline database connectivity (POSTGRES_USER -> POSTGRES_DB)...'
+
+    $result = Invoke-DockerCompose -Arguments @(
+        'exec', '-T', 'postgres', 'bash', '-lc',
+        'set -euo pipefail; export PGPASSWORD="${POSTGRES_PASSWORD?}"; psql -h 127.0.0.1 -U "${POSTGRES_USER?}" -d "${POSTGRES_DB?}" -v ON_ERROR_STOP=1 -c "SELECT 1" >/dev/null'
+    ) -AllowNonZeroExitCode
+
+    if ($result.ExitCode -ne 0) {
+        throw (
+            "Pipeline Postgres authentication or database access failed (user=`$POSTGRES_USER, db=`$POSTGRES_DB).`n" +
+            "Typical causes: wrong POSTGRES_PASSWORD in .env, or the Postgres volume predates init scripts (recreate with: docker compose down -v).`n" +
+            "$(Get-CommandOutputText -Result $result)"
+        )
+    }
+
+    Write-Info 'Pipeline Postgres connectivity OK.'
+}
+
+function Escape-SqlLiteralForBash {
+    param([string]$Value)
+
+    if ([string]::IsNullOrEmpty($Value)) {
+        return ''
+    }
+
+    return $Value.Replace("'", "''")
+}
+
+function Wrap-BashSingleQuotedArgument {
+    param([string]$Inner)
+
+    return "'" + ($Inner.Replace("'", "'\''")) + "'"
+}
+
+function Assert-AirflowPostgresObjectsExist {
+    Write-Info 'Checking that Airflow metadata role and database exist (postgres init scripts)...'
+
+    $repoRoot = Get-RepoRoot
+    $dotenvPath = Join-Path -Path $repoRoot -ChildPath '.env'
+    $vars = Get-DotEnvVariables -LiteralPath $dotenvPath
+
+    $eu = Escape-SqlLiteralForBash -Value ([string]$vars['AIRFLOW_DB_USER'])
+    $ed = Escape-SqlLiteralForBash -Value ([string]$vars['AIRFLOW_DB_NAME'])
+
+    $checkSql = "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '$eu') AND EXISTS (SELECT 1 FROM pg_database WHERE datname = '$ed') THEN 0 ELSE 1 END;"
+    $sqlArg = Wrap-BashSingleQuotedArgument -Inner $checkSql
+
+    $remoteSh = 'set -eu; export PGPASSWORD="${POSTGRES_PASSWORD}"; r=$(psql -h 127.0.0.1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -v ON_ERROR_STOP=1 -tAc ' + $sqlArg + ' | tr -d "[:space:]"); if [ "$r" = "0" ]; then exit 0; elif [ "$r" = "1" ]; then echo "MISSING_AIRFLOW_PROVISIONING check_sql_returned=1" >&2; exit 2; else echo "MISSING_AIRFLOW_PROVISIONING unexpected_r=${r:-empty}" >&2; exit 2; fi'
+
+    $result = Invoke-DockerCompose -Arguments @('exec', '-T', 'postgres', 'sh', '-lc', $remoteSh) -AllowNonZeroExitCode
+
+    if ($result.ExitCode -eq 0) {
+        Write-Info 'Airflow metadata role and database are present in Postgres.'
+        return
+    }
+
+    if ($result.ExitCode -eq 2) {
+        throw (
+            "Airflow metadata is not provisioned in Postgres: the role (AIRFLOW_DB_USER) and/or database (AIRFLOW_DB_NAME) is missing or the check failed.`n`n" +
+            "This usually means the Postgres data volume was created before infra/postgres/init ran, so /docker-entrypoint-initdb.d never ran.`n`n" +
+            "Fix (from the repository root; destroys Postgres data):`n" +
+            "  docker compose down -v`n" +
+            "  docker compose up -d`n`n" +
+            "Then re-run bootstrap. Confirm init ran: docker compose logs postgres | Select-String -Pattern 'Airflow metadata|CREATE DATABASE'`n`n" +
+            "Details:`n$(Get-CommandOutputText -Result $result)"
+        )
+    }
+
+    throw (
+        "Could not verify Airflow metadata provisioning in Postgres.`n" +
+        "$(Get-CommandOutputText -Result $result)"
+    )
+}
+
+function Test-PostgresAirflowMetadataRole {
+    Write-Info 'Validating Airflow metadata database connectivity (AIRFLOW_DB_USER -> AIRFLOW_DB_NAME)...'
+
+    $result = Invoke-DockerCompose -Arguments @(
+        'exec', '-T', 'postgres', 'bash', '-lc',
+        'set -euo pipefail; export PGPASSWORD="${AIRFLOW_DB_PASSWORD?}"; psql -h 127.0.0.1 -U "${AIRFLOW_DB_USER?}" -d "${AIRFLOW_DB_NAME?}" -v ON_ERROR_STOP=1 -c "SELECT 1" >/dev/null'
+    ) -AllowNonZeroExitCode
+
+    if ($result.ExitCode -ne 0) {
+        throw (
+            "Airflow metadata Postgres authentication or database access failed (user=`$AIRFLOW_DB_USER, db=`$AIRFLOW_DB_NAME).`n" +
+            "Typical causes: AIRFLOW_DB_* not provisioned (recreate Postgres volume after adding infra/postgres/init), or password mismatch vs AIRFLOW__DATABASE__SQL_ALCHEMY_CONN.`n" +
+            "$(Get-CommandOutputText -Result $result)"
+        )
+    }
+
+    Write-Info 'Airflow metadata Postgres connectivity OK.'
+}
+
+function Wait-AirflowInitCompleted {
+    param(
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+    )
+
+    Write-Info "Waiting for airflow-init to finish (timeout ${TimeoutSeconds}s)..."
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $result = Invoke-DockerCompose -Arguments @('ps', '-a', '--format', 'json') -AllowNonZeroExitCode
+        if ($result.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($result.StdOutText)) {
+            Start-Sleep -Seconds 3
+            continue
+        }
+
+        $record = $null
+        foreach ($line in ($result.StdOutText -split "`r?`n")) {
+            if ([string]::IsNullOrWhiteSpace($line)) {
+                continue
+            }
+
+            try {
+                $candidate = $line | ConvertFrom-Json
+            }
+            catch {
+                continue
+            }
+
+            if ($candidate.Service -eq 'airflow-init') {
+                $record = $candidate
+                break
+            }
+        }
+
+        if ($null -eq $record) {
+            Start-Sleep -Seconds 3
+            continue
+        }
+
+        $state = [string]$record.State
+        if ($state -match '(?i)exited') {
+            $exitCode = [int]$record.ExitCode
+            if ($exitCode -eq 0) {
+                Write-Info 'airflow-init completed successfully.'
+                return
+            }
+
+            throw (
+                "airflow-init failed (exit code $exitCode). This usually indicates Airflow cannot migrate its metadata database.`n" +
+                "Check: docker compose logs --tail=200 airflow-init`n" +
+                "Validate AIRFLOW__DATABASE__SQL_ALCHEMY_CONN matches AIRFLOW_DB_* and that the airflow database exists."
+            )
+        }
+
+        Start-Sleep -Seconds 3
+    }
+
+    throw (
+        "Timed out waiting for airflow-init to complete.`n" +
+        "Check: docker compose ps airflow-init`n" +
+        "Logs: docker compose logs --tail=200 airflow-init"
+    )
+}
+
+function Test-AirflowMetadataDbCheck {
+    param(
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+    )
+
+    Write-Info "Running 'airflow db check' (timeout ${TimeoutSeconds}s)..."
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $lastFailure = $null
+    while ((Get-Date) -lt $deadline) {
+        $result = Invoke-DockerCompose -Arguments @(
+            'exec', '-T', 'airflow-webserver', 'airflow', 'db', 'check'
+        ) -AllowNonZeroExitCode
+
+        if ($result.ExitCode -eq 0) {
+            Write-Info "Airflow metadata DB check OK."
+            return
+        }
+
+        $lastFailure = $result
+        Start-Sleep -Seconds 4
+    }
+
+    $details = if ($null -ne $lastFailure) {
+        Get-CommandOutputText -Result $lastFailure
+    }
+    else {
+        'No additional details were returned.'
+    }
+
+    throw (
+        "airflow db check did not succeed before timeout.`n" +
+        "This indicates Airflow cannot use its configured metadata database.`n" +
+        "Check: docker compose logs --tail=200 airflow-webserver`n" +
+        "$details"
+    )
+}
+
+function Test-PostgresProvisioning {
+    Wait-PostgresReady -TimeoutSeconds 120
+    Test-PostgresPipelineRole
+    Assert-AirflowPostgresObjectsExist
+    Test-PostgresAirflowMetadataRole
+    Wait-AirflowInitCompleted -TimeoutSeconds 600
+    Test-AirflowMetadataDbCheck -TimeoutSeconds 180
+}
+
 function Test-RequiredFiles {
     Write-Info 'Validating required environment files...'
 
@@ -278,9 +582,16 @@ function Invoke-HealthCheck {
 }
 
 function Main {
+    $repoRoot = Get-RepoRoot
+    Set-Location -LiteralPath $repoRoot
+
     Write-Info 'Running bootstrap preflight checks...'
 
-    Test-RequiredFiles
+    $dotenvPath = Join-Path -Path $repoRoot -ChildPath '.env'
+    $envVars = Get-DotEnvVariables -LiteralPath $dotenvPath
+    Assert-RequiredDotEnvKeys -EnvVars $envVars
+
+    Test-RequiredFiles -RepoRoot $repoRoot
 
     Require-Command -Name 'docker' -Hint 'Install Docker and ensure it is on PATH.'
     Require-Command -Name 'abctl' -Hint 'Install Airbyte abctl and ensure it is on PATH.'
@@ -289,6 +600,7 @@ function Main {
     Test-DockerCompose
 
     Start-CoreServices
+    Test-PostgresProvisioning
     Ensure-AirbyteRunning
     Invoke-HealthCheck
 
