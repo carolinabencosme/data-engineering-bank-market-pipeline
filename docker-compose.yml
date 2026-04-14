@@ -4,12 +4,16 @@ services:
     container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-postgres
     restart: unless-stopped
     env_file:
+      - .env
       - ./infra/postgres/postgres.env
+    environment:
+      PGDATA: ${POSTGRES_PGDATA:-/var/lib/postgresql/data/pgdata}
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./infra/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
     command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pipeline} -d ${POSTGRES_DB:-bank_market}"]
@@ -26,6 +30,7 @@ services:
     container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-clickhouse
     restart: unless-stopped
     env_file:
+      - .env
       - ./infra/clickhouse/clickhouse.env
     ports:
       - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
@@ -80,6 +85,7 @@ services:
     container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow-webserver
     restart: unless-stopped
     env_file:
+      - .env
       - ./infra/airflow/airflow.env
     user: "${AIRFLOW_UID:-50000}:0"
     ports:
@@ -109,6 +115,7 @@ services:
     container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow-scheduler
     restart: unless-stopped
     env_file:
+      - .env
       - ./infra/airflow/airflow.env
     user: "${AIRFLOW_UID:-50000}:0"
     volumes:
@@ -130,6 +137,7 @@ services:
     container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-dbt
     restart: unless-stopped
     env_file:
+      - .env
       - ./infra/dbt/dbt.env
     working_dir: /usr/app
     volumes:
