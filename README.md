@@ -1,4 +1,3 @@
-````md
 # data-engineering-bank-market-pipeline
 
 Pipeline de ingeniería de datos para extraer, validar, transformar y servir información de mercado de bancos listados en la bolsa de valores de Estados Unidos, utilizando Docker, PostgreSQL, ClickHouse, Airbyte, dbt y Airflow.
@@ -73,7 +72,7 @@ Las herramientas principales utilizadas en la solución son:
 - **Docker Compose**: orquestación local de los servicios core del pipeline
 - **PostgreSQL**: landing zone para datos crudos
 - **ClickHouse**: entorno OLAP para datos curados y explotación analítica
-- **Airbyte**: integración de datos entre etapas del pipeline
+- **Airbyte**: plataforma opcional de integración local (provisionada con `abctl`; no es el path activo de carga en este repo)
 - **dbt**: validación, modelado y transformación de datos
 - **Airflow**: orquestación y automatización del pipeline
 - **Python + yfinance**: extracción de datos desde Yahoo Finance
@@ -91,7 +90,10 @@ La arquitectura del proyecto separa claramente las responsabilidades del flujo d
    - Los datos crudos se almacenan inicialmente en PostgreSQL.
 
 3. **Integración**
-   - Airbyte se utiliza para mover datos entre los componentes del pipeline.
+   - La integración activa del flujo de datos se implementa con **Airflow + Python**:
+     - `load_landing`: UPSERT a `landing.*` en PostgreSQL.
+     - `load_olap`: sincronización incremental `landing -> olap.stg_*` y rebuild deduplicado de `olap.cur_*`.
+   - Airbyte se mantiene como plataforma opcional para una integración futura, gestionada por `abctl`.
 
 4. **Validación y transformación**
    - dbt implementa reglas de calidad y transforma los datos hacia estructuras curadas.
@@ -102,12 +104,15 @@ La arquitectura del proyecto separa claramente las responsabilidades del flujo d
 6. **Orquestación**
    - Airflow automatiza y coordina la ejecución del pipeline.
 
-> **Nota:** El diagrama de arquitectura debe incluirse en la carpeta de documentación o en este README una vez finalizado.
+Diagrama y decisiones de arquitectura: [docs/architecture.md](docs/architecture.md).
 
 ## Estructura del proyecto
 
 ```text
 .
+├── src/
+│   ├── extract/          # Cliente Yahoo (solo lectura)
+│   └── load/               # UPSERT a tablas landing en Postgres
 ├── dbt/
 │   ├── models/
 │   ├── snapshots/
@@ -234,6 +239,16 @@ En el **mismo** servidor PostgreSQL conviven dos bases lógicas distintas:
 * **`AIRFLOW_DB_NAME` (por defecto `airflow`)**: metadata interna de Airflow; usuario **`AIRFLOW_DB_USER`** (por defecto `airflow`).
 
 La cadena `AIRFLOW__DATABASE__SQL_ALCHEMY_CONN` del `.env` debe apuntar a la base de metadata (`AIRFLOW_DB_NAME`) con el usuario `AIRFLOW_DB_USER`. No se reutiliza `bank_market` para metadata de Airflow.
+
+### Airflow → PostgreSQL landing (`bank_market`) — ingesta Fase 1
+
+El DAG `bank_market_pipeline` separa **extracción** (solo lectura a Yahoo vía [`src/extract/yahoo_finance_client.py`](src/extract/yahoo_finance_client.py)) y **carga** (UPSERT en tablas `landing.*` vía [`src/load/landing_psql_loader.py`](src/load/landing_psql_loader.py)). Entre ambas tareas el payload intermedio se guarda en disco bajo `PIPELINE_XCOM_SCRATCH_DIR` (por defecto `airflow/dags/_pipeline_scratch/` montado en el contenedor) para evitar volúmenes grandes en XCom.
+
+* **Idempotencia:** cada tabla usa su llave natural definida en [`sql/landing/V001__create_landing_tables.sql`](sql/landing/V001__create_landing_tables.sql); en conflicto se actualizan columnas de negocio, `ingested_at`, `source_system` y `batch_id` (trazabilidad por corrida `DAG_ID + run_id`).
+* **Conexión:** el task de carga usa `PostgresHook` con `AIRFLOW__PIPELINE__LANDING_CONN_ID` (por defecto `postgres_landing`). Debe existir una conexión Airflow apuntando a `POSTGRES_DB` con el usuario del pipeline, o definir en `.env` la URI estándar `AIRFLOW_CONN_POSTGRES_LANDING` (ver `.env.example`).
+* **Configuración:** símbolos y ventana temporal se controlan con `PIPELINE_YAHOO_SYMBOLS`, `PIPELINE_BANK_UNIVERSE_LIMIT`, `PIPELINE_EXTRACT_*`, throttling con `PIPELINE_YAHOO_BATCH_SIZE` / `PIPELINE_YAHOO_BATCH_PAUSE_SECONDS`, y `PIPELINE_SOURCE_SYSTEM` para la columna homónima en landing.
+
+Los servicios `airflow-webserver` y `airflow-scheduler` montan `./src` con `PYTHONPATH=/opt/airflow/pipeline` para importar `src.*` sin duplicar código fuera del repositorio.
 
 En el primer arranque con un volumen de datos **vacío**, los scripts montados en `infra/postgres/init/` (por ejemplo `10-create-airflow-metadata.sh`) crean automáticamente el rol y la base de Airflow. El SQL usa literales interpolados desde el shell (escapando comillas simples), porque las variables de cliente `psql` del tipo `:'nombre` **no** son sustituibles de forma fiable dentro de bloques `DO ... $$` enviados al servidor. Además, **`CREATE DATABASE` no puede ejecutarse dentro de un `DO`**; el script crea el rol en un `DO` y la base con sentencias de nivel superior (incl. `\gexec` en `psql`). El script usa **POSIX `sh`** (sin bashismos como `[[`) para que sea válido también cuando la imagen de Postgres lo **carga con `. script`** en lugar de ejecutarlo (puede ocurrir en Windows si el bind mount no conserva el bit ejecutable).
 
@@ -378,12 +393,55 @@ abctl local logs
 De forma general, el pipeline sigue esta secuencia:
 
 1. El extractor en Python consulta Yahoo Finance.
-2. Los datos crudos se cargan en PostgreSQL.
-3. Airbyte mueve o integra la información entre capas según el diseño del flujo.
-4. dbt valida y transforma los datos.
-5. Los datos curados se cargan en ClickHouse.
-6. Se genera una tabla de resumen mensual.
-7. Airflow automatiza la ejecución y actualización del pipeline.
+2. Los datos crudos se cargan en PostgreSQL (`landing.*`).
+3. `check_new_landing_rows` evalúa watermark y decide ejecución downstream.
+4. dbt (`target=dev`) valida y transforma **PostgreSQL** (`landing` → `analytics` staging/marts).
+5. Airflow carga a ClickHouse (`load_olap`: `landing -> olap.stg_* -> olap.cur_*`).
+6. dbt (`target=olap`) materializa el mart mensual en ClickHouse: `olap.mart_monthly_stock_summary`.
+7. Airflow aplica quality gates y confirma watermark (`commit_watermark`).
+
+Para disparo desacoplado desde landing (sin extracción Yahoo), también está disponible el DAG `bank_market_landing_to_olap`, que ejecuta `check_new_landing_rows -> dbt_prepare_deps -> dbt_validation -> load_olap -> monthly_summary` con las mismas validaciones y watermark.
+
+## Rol real de Airbyte en este repositorio
+
+Airbyte está **instalado/provisionado** para entorno local mediante `abctl` y se verifica en bootstrap/health checks, pero **no participa en la ruta de datos activa** del pipeline.
+
+- Sí se usa:
+  - `scripts/bootstrap.*`: levantar/validar estado `abctl local status`.
+  - `scripts/check-health.*`: health check operativo de Airbyte.
+- No se usa actualmente:
+  - Conexiones/sync jobs que muevan `landing -> ClickHouse`.
+  - Integración API de Airbyte en DAGs.
+
+Para detalle de alternativas y plan de integración futura, ver [docs/airbyte_integration_options.md](docs/airbyte_integration_options.md).
+
+## Contrato de watermark y detección de cambios en landing
+
+El DAG `bank_market_pipeline` utiliza una marca de agua (`bank_market_pipeline__landing_ingested_at_watermark`) para decidir si corre transformaciones downstream:
+
+1. Calcula `MAX(ingested_at)` sobre `landing.bank_basic_info`, `landing.stock_daily_price`, `landing.bank_fundamentals`, `landing.holders`, `landing.ratings`.
+2. Si `MAX(ingested_at)` no supera el watermark, se hace `skip` de dbt/OLAP/mart.
+3. Excepción de drift: si ClickHouse staging está vacío y landing tiene datos, se fuerza resync completo.
+4. Al finalizar exitosamente, `commit_watermark` persiste la nueva marca.
+
+Esto asume que cualquier mutación relevante en landing actualiza `ingested_at`.
+
+## Semántica `stg_*` vs `cur_*`
+
+- `olap.stg_*`: capa técnica **append/versionada** (física). Puede crecer por re-corridas; `count()` incluye versiones no fusionadas.
+- `olap.cur_*`: capa de negocio **deduplicada** por llave natural.
+- `olap.mart_monthly_stock_summary`: agregado mensual determinista construido desde `cur_*`.
+
+Runbook mínimo para inspección operativa:
+
+```powershell
+docker compose exec -T clickhouse clickhouse-client --query "SELECT count() FROM olap.stg_stock_daily_price"
+docker compose exec -T clickhouse clickhouse-client --query "SELECT count() FROM olap.stg_stock_daily_price FINAL"
+docker compose exec -T clickhouse clickhouse-client --query "SELECT count() FROM olap.cur_stock_daily_price"
+docker compose exec -T clickhouse clickhouse-client --query "OPTIMIZE TABLE olap.stg_stock_daily_price FINAL"
+```
+
+`OPTIMIZE ... FINAL` debe usarse solo en ventanas controladas de mantenimiento (costo alto de CPU/IO).
 
 ## Servicios de Airflow en Docker Compose
 
@@ -394,6 +452,13 @@ El stack local utiliza una separación explícita de servicios de Airflow para m
 * `airflow-scheduler`: ejecuta el scheduler
 
 Esta separación evita ocultar fallos del webserver detrás de un solo contenedor con múltiples procesos y simplifica el troubleshooting.
+
+Para ejecutar tareas `dbt` desde el DAG (`dbt_validation`, `monthly_summary`), los servicios de Airflow usan una imagen personalizada definida en `infra/airflow/Dockerfile` que instala **`dbt-postgres` y `dbt-clickhouse`**. El Compose también monta:
+
+* `./dbt` en `/opt/airflow/dbt`
+* `./infra/dbt` en `/opt/airflow/infra/dbt`
+
+Esto mantiene al DAG autocontenible en el runtime de Airflow sin depender de comandos externos al contenedor.
 
 ## Consideraciones sobre la extracción desde Yahoo Finance
 
@@ -422,15 +487,46 @@ La validación de calidad se implementa con dbt y debe cubrir, como mínimo:
 
 También se deben documentar las reglas de calidad implementadas y su propósito.
 
-## Tabla de resumen mensual
+## Validación OLAP y mart mensual (`mart_monthly_stock_summary`)
 
-Como salida analítica, el pipeline debe construir una tabla mensual que incluya:
+### Capas
 
-* promedio mensual de apertura de la acción
-* promedio mensual de cierre de la acción
-* promedio mensual del volumen de la acción
+| Capa | Ubicación | Notas |
+|------|-----------|--------|
+| Landing | PostgreSQL `landing.*` | Ingesta Airflow. |
+| OLAP curated | ClickHouse `olap.cur_*` | Desde landing vía `load_olap`. |
+| Mart mensual | ClickHouse `olap.mart_monthly_stock_summary` | dbt `target=olap`, modelo `dbt/models/olap/mart_monthly_stock_summary.sql`. |
 
-Esta tabla sirve como ejemplo de consumo analítico a partir de los datos curados en la capa OLAP.
+### Comandos útiles (desde la raíz del repo)
+
+```powershell
+docker compose exec -T clickhouse clickhouse-client --query "SHOW TABLES FROM olap"
+docker compose exec -T clickhouse clickhouse-client --query "SELECT * FROM olap.mart_monthly_stock_summary ORDER BY symbol, year, month LIMIT 20"
+docker compose exec -T clickhouse clickhouse-client --query "SELECT count() FROM olap.mart_monthly_stock_summary"
+docker compose exec -T clickhouse clickhouse-client --query "SELECT symbol, year, month, count() AS c FROM olap.mart_monthly_stock_summary GROUP BY symbol, year, month HAVING c > 1"
+docker compose exec -T clickhouse clickhouse-client --query "SELECT year, count() FROM olap.mart_monthly_stock_summary GROUP BY year ORDER BY year"
+docker compose exec -T clickhouse clickhouse-client --query "SELECT count() AS invalid_rows FROM olap.mart_monthly_stock_summary WHERE avg_open_price < 0 OR avg_close_price < 0 OR avg_volume < 0 OR trading_days_count <= 0"
+```
+
+### dbt (dos targets)
+
+* **dev** (Postgres): `dbt run --target dev --select path:models/staging path:models/marts`
+* **olap** (ClickHouse): `dbt run --target olap --select path:models/olap` (requiere `DBT_CH_*` en el entorno; ver `.env.example`).
+
+Documentación ampliada: `docs/mart_monthly_stock_summary.md`.
+
+### Criterios de aceptación (resumen)
+
+* Tabla `olap.mart_monthly_stock_summary` existe y tiene datos cuando `cur_stock_daily_price` tiene filas en ventana.
+* Unicidad lógica (`symbol`, `year`, `month`); años 2024–2025; métricas no negativas; `dbt test --target olap` en verde.
+* Airflow: tareas `validate_olap_curated` y `validate_monthly_mart` fallan si hay datos upstream pero OLAP/mart vacíos (evita éxito falso).
+
+### Screenshots sugeridos (entrega)
+
+1. Airflow: grafo del DAG `bank_market_pipeline` con tasks en verde.
+2. `dbt test --target olap` finalizado sin errores.
+3. Resultado de `SELECT * FROM olap.mart_monthly_stock_summary LIMIT 20`.
+4. Consulta de duplicados (cero filas esperadas).
 
 ## Buenas prácticas aplicadas
 
@@ -484,14 +580,12 @@ El flujo ideal de ejecución para un usuario nuevo sería:
 
 ## Evidencias y documentación adicional
 
-Este README debe complementarse con:
+Checklist y comandos reproducibles de evidencia:
 
-* diagrama de arquitectura
-* screenshots de los servicios levantados
-* screenshots del UI de Airbyte, Airflow y otros componentes relevantes
-* evidencia de ejecución del pipeline
-* evidencia de validaciones en dbt
-* evidencia del resumen mensual en la capa OLAP
+- [docs/evidence/README.md](docs/evidence/README.md)
+- [docs/architecture.md](docs/architecture.md)
+- [docs/compliance_checklist.md](docs/compliance_checklist.md)
+- [docs/data_mapping.md](docs/data_mapping.md)
 
 ## Troubleshooting básico
 
@@ -533,6 +627,9 @@ Este README debe complementarse con:
 * Confirmar estado: `docker compose ps`
 * Ver logs: `docker compose logs --tail=100 dbt`
 * Revisar `infra/dbt/dbt.env` y `infra/dbt/profiles.yml`
+* Si el error es `/bin/bash: dbt: command not found` en tareas de Airflow, reconstruir imagen y recrear servicios:
+  * `docker compose build airflow-init airflow-webserver airflow-scheduler`
+  * `docker compose up -d airflow-webserver airflow-scheduler --force-recreate`
 
 ### 7) `dbt` muestra `No such command 'sleep'`
 
@@ -602,9 +699,8 @@ Las siguientes reglas quedaron declaradas en dbt para validación continua:
 
 ### Materializaciones y snapshots
 
-* **Incremental en marts:** hechos, dimensión principal y agregado mensual usan materialización incremental con estrategia `delete+insert`
+* **Materialización en marts:** en `dbt/models/marts/` hay modelos incrementales (`delete+insert`) y modelos materializados como `table` (por ejemplo `monthly_bank_stock_summary`).
 * **Snapshot SCD:** `snap_dim_bank_profile` usa estrategia por `timestamp` (`ingested_at`) para preservar histórico de cambios de la dimensión de perfiles de banco
 
 Esto permite mantener costos de procesamiento bajos en cargas recurrentes y, al mismo tiempo, conservar trazabilidad histórica para análisis temporal.
 
-````
