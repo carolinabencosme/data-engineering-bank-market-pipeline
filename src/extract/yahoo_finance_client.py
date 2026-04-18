@@ -11,6 +11,12 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import requests
 
+from src.extract.yfinance_fallback import (
+    extract_dataset_via_yfinance,
+    yfinance_fallback_enabled,
+    yfinance_package_available,
+)
+
 
 DEFAULT_START_DATE = date(2024, 1, 1)
 DEFAULT_END_DATE = date(2025, 12, 31)
@@ -122,7 +128,7 @@ class YahooFinanceClient:
         return self._extract_quote_summary_dataset(
             symbols=symbols,
             dataset="basics",
-            modules=["assetProfile"],
+            modules=["assetProfile", "price", "summaryDetail"],
             mapper=self._map_basics,
         )
 
@@ -192,26 +198,105 @@ class YahooFinanceClient:
         for batch_number, batch in enumerate(_chunked(symbols, self.batch_config.batch_size), start=1):
             self._log(f"{dataset}_batch_start", batch=batch_number, symbol_count=len(batch), status="started")
             for symbol in batch:
+                records: list[LandingRecord] = []
+                http_error: str | None = None
+                used_yfinance = False
                 try:
                     endpoint = f"{self.base_url}/v10/finance/quoteSummary/{symbol}"
                     params = {"modules": ",".join(modules)}
                     data = self._request_json("GET", endpoint, params=params)
                     records = mapper(symbol, data)
-                    all_records.extend(records)
-                    self._log(f"{dataset}_symbol", symbol=symbol, batch=batch_number, status="ok", rows=len(records))
+                    if self._should_retry_quote_summary_with_yfinance(dataset, records):
+                        records = []
                 except Exception as exc:  # noqa: BLE001
-                    self._log(f"{dataset}_symbol", symbol=symbol, batch=batch_number, status="error", error=str(exc))
+                    http_error = str(exc)
+                    self._log(f"{dataset}_symbol", symbol=symbol, batch=batch_number, status="http_error", error=http_error)
+
+                if not records and yfinance_fallback_enabled() and yfinance_package_available():
+                    try:
+                        yf_rows = extract_dataset_via_yfinance(symbol, dataset)
+                        if yf_rows:
+                            records = yf_rows
+                            used_yfinance = True
+                        elif http_error:
+                            self._log(
+                                f"{dataset}_symbol",
+                                symbol=symbol,
+                                batch=batch_number,
+                                status="empty_after_fallback",
+                                http_error=http_error,
+                                message="yfinance returned no rows",
+                            )
+                    except Exception as y_exc:  # noqa: BLE001
+                        self._log(
+                            f"{dataset}_symbol",
+                            symbol=symbol,
+                            batch=batch_number,
+                            status="fallback_error",
+                            error=str(y_exc),
+                            http_error=http_error,
+                        )
+
+                if records:
+                    self._log(
+                        f"{dataset}_symbol",
+                        symbol=symbol,
+                        batch=batch_number,
+                        status="ok",
+                        rows=len(records),
+                        source="yfinance_fallback" if used_yfinance else "yahoo_http",
+                        http_error=http_error,
+                    )
+                elif not http_error:
+                    self._log(
+                        f"{dataset}_symbol",
+                        symbol=symbol,
+                        batch=batch_number,
+                        status="warning",
+                        message="no_rows_after_http_and_fallback",
+                        yfinance_available=yfinance_package_available(),
+                        yfinance_fallback_enabled=yfinance_fallback_enabled(),
+                    )
+
+                all_records.extend(records)
             if self.batch_config.pause_between_batches_seconds > 0:
                 time.sleep(self.batch_config.pause_between_batches_seconds)
         return all_records
+
+    def _should_retry_quote_summary_with_yfinance(self, dataset: str, records: list[LandingRecord]) -> bool:
+        """Treat empty / hollow Yahoo payloads as miss so yfinance can backfill."""
+        if not yfinance_fallback_enabled() or not yfinance_package_available():
+            return False
+        if not records:
+            return True
+        if dataset == "basics":
+            pay = records[0].payload
+            return not any(pay.get(k) for k in ("industry", "sector", "company_name", "country", "fullTimeEmployees"))
+        if dataset == "fundamentals":
+            pay = records[0].payload
+            has_stmt = bool(pay.get("balanceSheetStatements"))
+            has_top = any(pay.get(k) is not None for k in ("totalAssets", "totalDebt", "investedCapital", "sharesOutstanding"))
+            return not has_stmt and not has_top
+        if dataset == "ratings":
+            return len(records) == 0
+        return False
 
     # ----------------
     # Mapping functions
     # ----------------
     def _map_basics(self, symbol: str, payload: Mapping[str, Any]) -> list[LandingRecord]:
         result = _first_result(payload, root="quoteSummary")
-        profile = result.get("assetProfile", {})
+        profile = result.get("assetProfile") or {}
+        price = result.get("price") or {}
+        summary = result.get("summaryDetail") or {}
+        company_name = (
+            profile.get("longName")
+            or price.get("longName")
+            or price.get("shortName")
+            or profile.get("name")
+        )
         fields = {
+            "company_name": company_name,
             "industry": profile.get("industry"),
             "sector": profile.get("sector"),
             "fullTimeEmployees": profile.get("fullTimeEmployees"),
@@ -221,6 +306,9 @@ class YahooFinanceClient:
             "country": profile.get("country"),
             "website": profile.get("website"),
             "address1": profile.get("address1"),
+            "exchange": price.get("exchangeName") or summary.get("exchange"),
+            "currency": price.get("currency") or summary.get("currency"),
+            "market_cap": price.get("marketCap") or summary.get("marketCap"),
         }
         return [LandingRecord(dataset="basics", symbol=symbol, record_date=None, payload=fields)]
 
@@ -267,7 +355,7 @@ class YahooFinanceClient:
                         "holder": row.get("organization"),
                         "shares": _raw(row.get("position")),
                         "value": _raw(row.get("value")),
-                        "holder_type": "fund",
+                        "holder_type": "mutual_fund",
                     },
                 )
             )
@@ -298,6 +386,7 @@ class YahooFinanceClient:
                         "from_grade": row.get("fromGrade"),
                         "action": row.get("action"),
                         "firm": row.get("firm"),
+                        "epochGradeDate": row.get("epochGradeDate"),
                     },
                 )
             )
@@ -388,7 +477,12 @@ class YahooFinanceClient:
 
 
 class LandingRepository:
-    """Persist raw datasets in landing tables with technical keys for idempotency."""
+    """
+    Legacy raw-landing helper kept for compatibility experiments.
+
+    The active pipeline path persists normalized records via src/load/landing_psql_loader.py
+    into landing.* tables. This class is intentionally not used by the Airflow DAG.
+    """
 
     def __init__(self, connection: Any) -> None:
         """
