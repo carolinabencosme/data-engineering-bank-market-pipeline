@@ -10,3 +10,11 @@ bank_market_pipeline:
       dbname: "{{ env_var('DBT_DB_NAME') }}"
       schema: "{{ env_var('DBT_DB_SCHEMA', 'analytics') }}"
       threads: "{{ env_var('DBT_THREADS', '4') | int }}"
+    olap:
+      type: clickhouse
+      host: "{{ env_var('DBT_CH_HOST') }}"
+      port: "{{ env_var('DBT_CH_HTTP_PORT') | int }}"
+      user: "{{ env_var('DBT_CH_USER') }}"
+      password: "{{ env_var('DBT_CH_PASSWORD', '') }}"
+      schema: "{{ env_var('DBT_CH_DATABASE', 'olap') }}"
+      threads: "{{ env_var('DBT_THREADS', '4') | int }}"

@@ -1,0 +1,76 @@
+version: 2
+
+models:
+  - name: mart_monthly_stock_summary
+    description: >
+      Mart mensual en ClickHouse (olap) construido desde cur_stock_daily_price, enriquecido con
+      company_name desde cur_bank_basic_info. Grano: symbol × year × month (ventana 2024–2025).
+      Materialización TABLE: rebuild determinista por ejecución; volumen acotado.
+
+      Supuestos: cur_* deduplicado; company_name vía argMax(company_name, ingested_at) por symbol;
+      trading_days_count = uniqExact(price_date); source_row_count = filas agregadas tras filtros.
+
+      Limitación: requiere load_olap previo; no imputa meses sin cotizaciones.
+    config:
+      tags: ["olap_clickhouse", "clickhouse_mart"]
+    columns:
+      - name: symbol
+        description: "Ticker (clave de negocio)."
+        data_tests:
+          - not_null
+      - name: company_name
+        description: "Nombre de compañía desde cur_bank_basic_info; puede ser NULL."
+      - name: year
+        description: "Año calendario (2024 o 2025 en la ventana configurada)."
+        data_tests:
+          - not_null
+          - accepted_values:
+              values: [2024, 2025]
+      - name: month
+        description: "Mes calendario (1–12)."
+        data_tests:
+          - not_null
+      - name: month_start_date
+        description: "Primer día del mes (toStartOfMonth)."
+        data_tests:
+          - not_null
+      - name: month_end_date
+        description: "Último día del mes (toLastDayOfMonth)."
+        data_tests:
+          - not_null
+      - name: avg_open_price
+        description: "Promedio mensual del precio de apertura (días que pasan filtros de calidad)."
+        data_tests:
+          - not_null
+      - name: avg_close_price
+        description: "Promedio mensual del precio de cierre."
+        data_tests:
+          - not_null
+      - name: avg_volume
+        description: "Volumen promedio diario en el mes."
+        data_tests:
+          - not_null
+      - name: min_open_price
+        description: "Mínimo de apertura en el mes."
+      - name: max_close_price
+        description: "Máximo de cierre en el mes."
+      - name: trading_days_count
+        description: "Días de negocio distintos (uniqExact de price_date)."
+        data_tests:
+          - not_null
+      - name: min_price_date
+        description: "Fecha mínima incluida en el agregado."
+        data_tests:
+          - not_null
+      - name: max_price_date
+        description: "Fecha máxima incluida en el agregado."
+        data_tests:
+          - not_null
+      - name: source_row_count
+        description: "Filas diarias agregadas (count) tras filtros."
+        data_tests:
+          - not_null
+      - name: loaded_at
+        description: "Timestamp UTC de generación (now64)."
+        data_tests:
+          - not_null

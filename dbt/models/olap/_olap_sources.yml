@@ -1,0 +1,26 @@
+version: 2
+
+sources:
+  - name: olap_curated
+    description: >
+      Tablas curated en ClickHouse (base olap). Son el resultado de landing → stg_* → cur_*;
+      este source solo se usa con el target `olap` (dbt-clickhouse).
+    schema: olap
+    tables:
+      - name: cur_stock_daily_price
+        description: "Precios diarios deduplicados por symbol y price_date."
+        columns:
+          - name: symbol
+          - name: price_date
+          - name: open_price
+          - name: high_price
+          - name: low_price
+          - name: close_price
+          - name: volume
+      - name: cur_bank_basic_info
+        description: "Perfil bancario deduplicado por symbol y snapshot_date (enriquecimiento opcional del mart)."
+        columns:
+          - name: symbol
+          - name: company_name
+          - name: snapshot_date
+          - name: ingested_at

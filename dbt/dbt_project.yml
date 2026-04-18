@@ -11,6 +11,11 @@ macro-paths: ["macros"]
 target-path: "target"
 clean-targets: ["target", "dbt_packages"]
 
+vars:
+  # Business window for ClickHouse mart (aligned with Yahoo extract defaults).
+  mart_monthly_start_date: "2024-01-01"
+  mart_monthly_end_date: "2025-12-31"
+
 models:
   bank_market_pipeline:
     +persist_docs:
@@ -26,6 +31,12 @@ models:
       +on_schema_change: sync_all_columns
       +schema: marts
       +tags: ["marts", "olap"]
+    olap:
+      +enabled: "{{ target.name == 'olap' }}"
+      +tags: ["olap_clickhouse", "clickhouse_mart"]
+      +meta:
+        layer: olap_mart
+        warehouse: clickhouse
 
 snapshots:
   bank_market_pipeline:
