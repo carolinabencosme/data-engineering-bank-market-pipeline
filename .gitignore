@@ -3,3 +3,17 @@
 !.env.example
 !*.env.example
 !*.env.template
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# dbt (dbt deps / compile & run output)
+dbt/dbt_packages/
+dbt/target/
+dbt/logs/
+
+# Repo-root logs (e.g. dbt invoked with log path outside dbt/logs)
+logs/
