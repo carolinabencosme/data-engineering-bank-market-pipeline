@@ -1,0 +1,3 @@
+# Ephemeral batch payloads between Airflow tasks (see PIPELINE_XCOM_SCRATCH_DIR).
+*
+!.gitignore
