@@ -1,6 +1,9 @@
 select
     symbol,
-    holder_type,
+    case
+        when lower(holder_type) = 'fund' then 'mutual_fund'
+        else lower(holder_type)
+    end as holder_type,
     holder_name,
     holdings_date,
     shares,
