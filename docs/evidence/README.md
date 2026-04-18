@@ -1,5 +1,3 @@
-
-```markdown
 # Evidencia de Cierre Técnico del Pipeline
 
 
@@ -125,7 +123,7 @@ Duración promedio: ~10 minutos por ejecución
 **Interpretación:**  
 El log de la tarea `load_olap` evidencia la inserción exitosa de datos en las tablas de staging (`stg_*`) en ClickHouse. Se observa el número de filas cargadas por cada entidad, incluyendo `stg_stock_daily_price` (3012 filas), `stg_bank_fundamentals` (30 filas), `stg_holders` (120 filas) y `stg_ratings` (2334 filas). 
 
-Asimismo, se registra un watermark temporal que confirma la ejecución de una carga incremental desde PostgreSQL hacia ClickHouse. La presencia del mensaje final "Carga OLAP incremental completada" y la ausencia de errores indican que la transferencia de datos hacia la capa OLAP staging se realizó correctamente.
+Asimismo, se registra un watermark temporal que confirma la ejecución de una carga incremental desde PostgreSQL hacia ClickHouse. La presencia del mensaje final **Carga OLAP incremental completada** y la ausencia de errores indican que la transferencia de datos hacia la capa OLAP staging se realizó correctamente.
 
 ---
 
@@ -296,12 +294,3 @@ El pipeline `bank_market_pipeline` ha sido validado exitosamente:
 * Sin duplicados en mart
 * Tests de calidad aprobados
 * Comportamiento idempotente confirmado
-
-
-
-
-```
-
-
-
-
