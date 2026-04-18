@@ -25,6 +25,25 @@ services:
       - data_plane
       - orchestration
 
+  postgres-schema-init:
+    image: postgres:${POSTGRES_IMAGE_TAG:-16-alpine}
+    container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-postgres-schema-init
+    restart: "no"
+    env_file:
+      - .env
+      - ./infra/postgres/postgres.env
+    volumes:
+      - ./sql:/workspace/sql:ro
+      - ./infra/postgres/apply_landing_schema.sh:/apply_landing_schema.sh:ro
+    # Inline `command: |` with `entrypoint: [sh, -ec]` was split by Compose into many CMD
+    # tokens, so almost none of the DDL ran. Use a mounted POSIX script instead.
+    entrypoint: ["/bin/sh", "/apply_landing_schema.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - data_plane
+      - orchestration
   clickhouse:
     image: clickhouse/clickhouse-server:${CLICKHOUSE_IMAGE_TAG:-24.8}
     container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-clickhouse
@@ -49,16 +68,42 @@ services:
     networks:
       - data_plane
 
+  clickhouse-schema-init:
+    image: clickhouse/clickhouse-server:${CLICKHOUSE_IMAGE_TAG:-24.8}
+    container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-clickhouse-schema-init
+    restart: "no"
+    env_file:
+      - .env
+      - ./infra/clickhouse/clickhouse.env
+    volumes:
+      - ./sql:/workspace/sql:ro
+      - ./infra/clickhouse/apply_olap_schema.sh:/apply_olap_schema.sh:ro
+    entrypoint: ["/bin/sh", "/apply_olap_schema.sh"]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    networks:
+      - data_plane
+      - orchestration
+
   airflow-init:
-    image: apache/airflow:${AIRFLOW_IMAGE_TAG:-2.11.2}
+    image: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow:${AIRFLOW_IMAGE_TAG:-2.11.2}
+    build:
+      context: .
+      dockerfile: ./infra/airflow/Dockerfile
+      args:
+        AIRFLOW_BASE_IMAGE: apache/airflow:${AIRFLOW_IMAGE_TAG:-2.11.2}
     container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow-init
     restart: "no"
     env_file:
+      - .env
       - ./infra/airflow/airflow.env
     user: "${AIRFLOW_UID:-50000}:0"
     volumes:
       - airflow_logs:/opt/airflow/logs
-      - airflow_dags:/opt/airflow/dags
+      - ./airflow/dags:/opt/airflow/dags
+      - ./dbt:/opt/airflow/dbt
+      - ./infra/dbt:/opt/airflow/infra/dbt:ro
       - ./infra/airflow/airflow.cfg:/opt/airflow/airflow.cfg:ro
     entrypoint:
       - /bin/bash
@@ -76,23 +121,42 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      postgres-schema-init:
+        condition: service_completed_successfully
+      clickhouse-schema-init:
+        condition: service_completed_successfully
     networks:
       - orchestration
       - data_plane
 
   airflow-webserver:
-    image: apache/airflow:${AIRFLOW_IMAGE_TAG:-2.11.2}
+    image: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow:${AIRFLOW_IMAGE_TAG:-2.11.2}
+    build:
+      context: .
+      dockerfile: ./infra/airflow/Dockerfile
+      args:
+        AIRFLOW_BASE_IMAGE: apache/airflow:${AIRFLOW_IMAGE_TAG:-2.11.2}
     container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow-webserver
     restart: unless-stopped
     env_file:
       - .env
       - ./infra/airflow/airflow.env
+    environment:
+      PYTHONPATH: /opt/airflow/pipeline
+      DBT_CH_HOST: ${CLICKHOUSE_HOST:-clickhouse}
+      DBT_CH_HTTP_PORT: ${CLICKHOUSE_HTTP_PORT:-8123}
+      DBT_CH_USER: ${CLICKHOUSE_USER:-default}
+      DBT_CH_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      DBT_CH_DATABASE: ${DBT_CH_DATABASE:-olap}
     user: "${AIRFLOW_UID:-50000}:0"
     ports:
       - "${AIRFLOW_WEBSERVER_PORT:-8080}:8080"
     volumes:
       - airflow_logs:/opt/airflow/logs
-      - airflow_dags:/opt/airflow/dags
+      - ./airflow/dags:/opt/airflow/dags
+      - ./src:/opt/airflow/pipeline/src:ro
+      - ./dbt:/opt/airflow/dbt
+      - ./infra/dbt:/opt/airflow/infra/dbt:ro
       - ./infra/airflow/airflow.cfg:/opt/airflow/airflow.cfg:ro
     command: ["webserver"]
     healthcheck:
@@ -104,6 +168,10 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      postgres-schema-init:
+        condition: service_completed_successfully
+      clickhouse-schema-init:
+        condition: service_completed_successfully
       airflow-init:
         condition: service_completed_successfully
     networks:
@@ -111,21 +179,40 @@ services:
       - data_plane
 
   airflow-scheduler:
-    image: apache/airflow:${AIRFLOW_IMAGE_TAG:-2.11.2}
+    image: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow:${AIRFLOW_IMAGE_TAG:-2.11.2}
+    build:
+      context: .
+      dockerfile: ./infra/airflow/Dockerfile
+      args:
+        AIRFLOW_BASE_IMAGE: apache/airflow:${AIRFLOW_IMAGE_TAG:-2.11.2}
     container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow-scheduler
     restart: unless-stopped
     env_file:
       - .env
       - ./infra/airflow/airflow.env
+    environment:
+      PYTHONPATH: /opt/airflow/pipeline
+      DBT_CH_HOST: ${CLICKHOUSE_HOST:-clickhouse}
+      DBT_CH_HTTP_PORT: ${CLICKHOUSE_HTTP_PORT:-8123}
+      DBT_CH_USER: ${CLICKHOUSE_USER:-default}
+      DBT_CH_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      DBT_CH_DATABASE: ${DBT_CH_DATABASE:-olap}
     user: "${AIRFLOW_UID:-50000}:0"
     volumes:
       - airflow_logs:/opt/airflow/logs
-      - airflow_dags:/opt/airflow/dags
+      - ./airflow/dags:/opt/airflow/dags
+      - ./src:/opt/airflow/pipeline/src:ro
+      - ./dbt:/opt/airflow/dbt
+      - ./infra/dbt:/opt/airflow/infra/dbt:ro
       - ./infra/airflow/airflow.cfg:/opt/airflow/airflow.cfg:ro
     command: ["scheduler"]
     depends_on:
       postgres:
         condition: service_healthy
+      postgres-schema-init:
+        condition: service_completed_successfully
+      clickhouse-schema-init:
+        condition: service_completed_successfully
       airflow-init:
         condition: service_completed_successfully
     networks:
@@ -133,13 +220,27 @@ services:
       - data_plane
 
   dbt:
-    image: ghcr.io/dbt-labs/dbt-postgres:${DBT_IMAGE_TAG:-1.8.latest}
+    build:
+      context: .
+      dockerfile: ./infra/dbt/Dockerfile
+      args:
+        DBT_BASE_IMAGE: ghcr.io/dbt-labs/dbt-postgres:${DBT_IMAGE_TAG:-1.8.latest}
+    image: ${COMPOSE_PROJECT_NAME:-bank-market}-dbt:${DBT_IMAGE_TAG:-1.8.latest}
     container_name: ${COMPOSE_PROJECT_NAME:-bank-market}-dbt
     restart: unless-stopped
     env_file:
       - .env
       - ./infra/dbt/dbt.env
-    working_dir: /usr/app
+    environment:
+      DBT_CH_HOST: ${CLICKHOUSE_HOST:-clickhouse}
+      DBT_CH_HTTP_PORT: ${CLICKHOUSE_HTTP_PORT:-8123}
+      DBT_CH_USER: ${CLICKHOUSE_USER:-default}
+      DBT_CH_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      DBT_CH_DATABASE: ${DBT_CH_DATABASE:-olap}
+      DBT_PROJECT_DIR: /usr/app/dbt
+      DBT_PROFILES_DIR: /root/.dbt
+    # Repo root is mounted at /usr/app; dbt_project.yml lives under ./dbt
+    working_dir: /usr/app/dbt
     volumes:
       - ./:/usr/app
       - ./infra/dbt/profiles.yml:/root/.dbt/profiles.yml:ro
@@ -156,6 +257,10 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
+      postgres-schema-init:
+        condition: service_completed_successfully
+      clickhouse-schema-init:
+        condition: service_completed_successfully
     networks:
       - data_plane
       - orchestration
@@ -181,6 +286,3 @@ volumes:
 
   airflow_logs:
     name: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow-logs
-
-  airflow_dags:
-    name: ${COMPOSE_PROJECT_NAME:-bank-market}-airflow-dags
