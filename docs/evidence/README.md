@@ -1,5 +1,5 @@
 
-````markdown
+```markdown
 # Evidencia de Cierre Técnico del Pipeline
 
 
@@ -44,7 +44,7 @@ El pipeline sigue el flujo:
 **Comando:**
 ```powershell
 docker compose ps
-````
+```
 
 **Resultado esperado:**
 
