@@ -1,6 +1,10 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$FoundationServices = @('postgres', 'clickhouse')
+$SchemaInitServices = @('postgres-schema-init', 'clickhouse-schema-init')
+$ApplicationServices = @('airflow-init', 'airflow-webserver', 'airflow-scheduler', 'dbt')
+
 function Write-Log {
     param(
         [Parameter(Mandatory = $true)][ValidateSet('INFO', 'WARN', 'ERROR')][string]$Level,
@@ -228,6 +232,70 @@ function Invoke-DockerCompose {
     return (Invoke-NativeCommand -FilePath 'docker' -Arguments (@('compose') + $Arguments) -AllowNonZeroExitCode:$AllowNonZeroExitCode)
 }
 
+function Wait-ServiceCompleted {
+    param(
+        [Parameter(Mandatory = $true)][string]$Service,
+        [int]$TimeoutSeconds = 300
+    )
+
+    Write-Info "Waiting for $Service to finish (timeout ${TimeoutSeconds}s)..."
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $result = Invoke-DockerCompose -Arguments @('ps', '-a', '--format', 'json') -AllowNonZeroExitCode
+        if ($result.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($result.StdOutText)) {
+            Start-Sleep -Seconds 3
+            continue
+        }
+
+        $record = $null
+        foreach ($line in ($result.StdOutText -split "`r?`n")) {
+            if ([string]::IsNullOrWhiteSpace($line)) {
+                continue
+            }
+
+            try {
+                $candidate = $line | ConvertFrom-Json
+            }
+            catch {
+                continue
+            }
+
+            if ($candidate.Service -eq $Service) {
+                $record = $candidate
+                break
+            }
+        }
+
+        if ($null -eq $record) {
+            Start-Sleep -Seconds 3
+            continue
+        }
+
+        $state = [string]$record.State
+        if ($state -match '(?i)exited|stopped') {
+            $exitCode = [int]$record.ExitCode
+            if ($exitCode -eq 0) {
+                Write-Info "$Service completed successfully."
+                return
+            }
+
+            throw (
+                "$Service failed (exit code $exitCode).`n" +
+                "Check: docker compose logs --tail=200 $Service"
+            )
+        }
+
+        Start-Sleep -Seconds 3
+    }
+
+    throw (
+        "Timed out waiting for $Service to complete.`n" +
+        "Check: docker compose ps -a $Service`n" +
+        "Logs: docker compose logs --tail=200 $Service"
+    )
+}
+
 function Wait-PostgresReady {
     param(
         [Parameter(Mandatory = $true)][int]$TimeoutSeconds
@@ -241,6 +309,7 @@ function Wait-PostgresReady {
             'exec', '-T', 'postgres', 'bash', '-lc',
             'export PGPASSWORD="${POSTGRES_PASSWORD?}"; pg_isready -h 127.0.0.1 -U "${POSTGRES_USER?}" -d "${POSTGRES_DB?}"'
         ) -AllowNonZeroExitCode
+
         if ($result.ExitCode -eq 0) {
             Write-Info 'Postgres is accepting connections.'
             return
@@ -253,6 +322,34 @@ function Wait-PostgresReady {
         "Postgres did not become reachable within ${TimeoutSeconds}s.`n" +
         "Check: docker compose ps postgres`n" +
         "Logs: docker compose logs --tail=200 postgres"
+    )
+}
+
+function Wait-ClickHouseReady {
+    param(
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+    )
+
+    Write-Info "Waiting for ClickHouse to accept connections (timeout ${TimeoutSeconds}s)..."
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $result = Invoke-DockerCompose -Arguments @(
+            'exec', '-T', 'clickhouse', 'clickhouse-client', '--query', 'SELECT 1'
+        ) -AllowNonZeroExitCode
+
+        if ($result.ExitCode -eq 0 -and $result.StdOutText.Trim() -eq '1') {
+            Write-Info 'ClickHouse is accepting connections.'
+            return
+        }
+
+        Start-Sleep -Seconds 2
+    }
+
+    throw (
+        "ClickHouse did not become reachable within ${TimeoutSeconds}s.`n" +
+        "Check: docker compose ps clickhouse`n" +
+        "Logs: docker compose logs --tail=200 clickhouse"
     )
 }
 
@@ -350,6 +447,78 @@ function Test-PostgresAirflowMetadataRole {
     Write-Info 'Airflow metadata Postgres connectivity OK.'
 }
 
+function Assert-PostgresLandingSchema {
+    Write-Info 'Validating landing schema and required tables in Postgres...'
+
+    # Same predicate as docker-compose postgres-schema-init (COUNT of known landing tables). Avoids relying
+    # on parsing multi-line psql stdout (Docker/encoding quirks) and matches the init job exactly.
+    $countSql = (@"
+SELECT COUNT(*)::text
+FROM pg_tables
+WHERE schemaname = 'landing'
+  AND tablename IN ('bank_basic_info','bank_fundamentals','holders','ratings','stock_daily_price');
+"@).Trim()
+
+    $sqlArg = Wrap-BashSingleQuotedArgument -Inner $countSql
+
+    $remoteSh = 'set -euo pipefail; ' +
+        'export PGPASSWORD="${POSTGRES_PASSWORD}"; ' +
+        'c=$(psql -t -A -P pager=off -h 127.0.0.1 -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -v ON_ERROR_STOP=1 -c ' + $sqlArg + ' | tr -d "[:space:]"); ' +
+        'if [ "$c" = "5" ]; then exit 0; fi; ' +
+        'echo "Landing schema validation failed: expected 5 landing tables, got count=${c:-empty}" >&2; exit 1'
+
+    $result = Invoke-DockerCompose -Arguments @(
+        'exec', '-T', 'postgres', 'bash', '-lc', $remoteSh
+    ) -AllowNonZeroExitCode
+
+    if ($result.ExitCode -ne 0) {
+        throw (
+            "Landing schema validation failed.`n" +
+            "$(Get-CommandOutputText -Result $result)`n" +
+            "Check: docker compose logs --tail=200 postgres-schema-init"
+        )
+    }
+
+    Write-Info 'Landing schema validation OK.'
+}
+
+function Assert-ClickHouseOlapSchema {
+    Write-Info 'Validating OLAP schema in ClickHouse...'
+
+    $result = Invoke-DockerCompose -Arguments @(
+        'exec', '-T', 'clickhouse', 'clickhouse-client', '--query', 'SHOW TABLES FROM olap'
+    ) -AllowNonZeroExitCode
+
+    if ($result.ExitCode -ne 0) {
+        throw (
+            "Failed to validate ClickHouse OLAP schema.`n" +
+            "$(Get-CommandOutputText -Result $result)"
+        )
+    }
+
+    $tables = @($result.StdOutLines | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $expected = @(
+        'stg_stock_daily_price',
+        'cur_stock_daily_price'
+    )
+
+    $missing = @()
+    foreach ($table in $expected) {
+        if ($tables -notcontains $table) {
+            $missing += $table
+        }
+    }
+
+    if ($missing.Count -gt 0) {
+        throw (
+            "ClickHouse OLAP schema validation failed. Missing expected table(s): $($missing -join ', ').`n" +
+            "Check: docker compose logs --tail=200 clickhouse-schema-init"
+        )
+    }
+
+    Write-Info 'ClickHouse OLAP schema validation OK.'
+}
+
 function Wait-AirflowInitCompleted {
     param(
         [Parameter(Mandatory = $true)][int]$TimeoutSeconds
@@ -429,7 +598,7 @@ function Test-AirflowMetadataDbCheck {
         ) -AllowNonZeroExitCode
 
         if ($result.ExitCode -eq 0) {
-            Write-Info "Airflow metadata DB check OK."
+            Write-Info 'Airflow metadata DB check OK.'
             return
         }
 
@@ -452,30 +621,29 @@ function Test-AirflowMetadataDbCheck {
     )
 }
 
-function Test-PostgresProvisioning {
-    Wait-PostgresReady -TimeoutSeconds 120
-    Test-PostgresPipelineRole
-    Assert-AirflowPostgresObjectsExist
-    Test-PostgresAirflowMetadataRole
-    Wait-AirflowInitCompleted -TimeoutSeconds 600
-    Test-AirflowMetadataDbCheck -TimeoutSeconds 180
-}
-
 function Test-RequiredFiles {
-    Write-Info 'Validating required environment files...'
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoRoot
+    )
+
+    Write-Info 'Validating required environment and project files...'
 
     $requiredFiles = @(
         '.env',
         'infra/postgres/postgres.env',
         'infra/clickhouse/clickhouse.env',
         'infra/airflow/airflow.env',
-        'infra/dbt/dbt.env'
+        'infra/dbt/dbt.env',
+        'airflow/dags/bank_market_pipeline.py',
+        'sql/landing/V001__create_landing_tables.sql',
+        'sql/olap/V001__create_staging_curated_tables.sql',
+        'sql/olap/V002__curated_dedup_policies.sql'
     )
 
     $missingFiles = @()
 
     foreach ($file in $requiredFiles) {
-        $fullPath = Join-Path -Path $PSScriptRoot -ChildPath "..\$file"
+        $fullPath = Join-Path -Path $RepoRoot -ChildPath $file
         if (-not (Test-Path -Path $fullPath -PathType Leaf)) {
             $missingFiles += $file
         }
@@ -491,30 +659,49 @@ function Test-RequiredFiles {
             "Copy-Item infra/dbt/dbt.env.example infra/dbt/dbt.env"
         ) -join '; '
 
-        throw "Missing required environment file(s):`n$missingList`nCreate them from templates with:`n$suggestedCommand"
+        throw "Missing required file(s):`n$missingList`nCreate missing env files from templates with:`n$suggestedCommand"
     }
 
-    Write-Info 'All required environment files are present.'
+    Write-Info 'All required environment and project files are present.'
 }
 
-function Start-CoreServices {
-    Write-Info 'Starting core services (postgres, clickhouse, airflow-init, airflow-webserver, airflow-scheduler, dbt)...'
+function Start-FoundationServices {
+    Write-Info 'Starting foundation services (postgres, clickhouse)...'
 
-    $result = Invoke-NativeCommand -FilePath 'docker' -Arguments @(
-        'compose', 'up', '-d',
-        'postgres',
-        'clickhouse',
-        'airflow-init',
-        'airflow-webserver',
-        'airflow-scheduler',
-        'dbt'
-    )
+    $result = Invoke-NativeCommand -FilePath 'docker' -Arguments (@('compose', 'up', '-d') + $FoundationServices)
 
     if ($result.ExitCode -ne 0) {
-        throw "Failed to start core services with Docker Compose.`n$(Get-CommandOutputText -Result $result)"
+        throw "Failed to start foundation services with Docker Compose.`n$(Get-CommandOutputText -Result $result)"
     }
 
-    Write-Info 'Core services started successfully.'
+    Write-Info 'Foundation services started successfully.'
+}
+
+function Start-SchemaInitializationServices {
+    Write-Info 'Starting schema initialization services (postgres-schema-init, clickhouse-schema-init)...'
+
+    # Always recreate one-shot init containers so DDL re-runs after `docker compose down -v` (or any fresh
+    # Postgres volume). Without --force-recreate, Compose may leave a previous Exited(0) container in place
+    # and skip re-running the job while Postgres is empty again.
+    $result = Invoke-NativeCommand -FilePath 'docker' -Arguments (@('compose', 'up', '-d', '--force-recreate') + $SchemaInitServices)
+
+    if ($result.ExitCode -ne 0) {
+        throw "Failed to start schema initialization services with Docker Compose.`n$(Get-CommandOutputText -Result $result)"
+    }
+
+    Write-Info 'Schema initialization services started successfully.'
+}
+
+function Start-ApplicationServices {
+    Write-Info 'Starting application services (airflow-init, airflow-webserver, airflow-scheduler, dbt)...'
+
+    $result = Invoke-NativeCommand -FilePath 'docker' -Arguments (@('compose', 'up', '-d') + $ApplicationServices)
+
+    if ($result.ExitCode -ne 0) {
+        throw "Failed to start application services with Docker Compose.`n$(Get-CommandOutputText -Result $result)"
+    }
+
+    Write-Info 'Application services started successfully.'
 }
 
 function Test-AirbyteStatusHealthy {
@@ -535,7 +722,7 @@ function Ensure-AirbyteRunning {
     $statusResult = Invoke-NativeCommand -FilePath 'abctl' -Arguments @('local', 'status') -AllowNonZeroExitCode
     $statusText = @($statusResult.StdOutText, $statusResult.StdErrText) -join [Environment]::NewLine
 
-    if ($statusResult.ExitCode -eq 0 -and (Test-AirbyteStatusHealthy -StatusText $statusText)) {
+    if ($statusResult.ExitCode -eq 0 -and (Test-AirbyteStatusHealthy -StatusText $StatusText)) {
         Write-Info 'Airbyte is already running.'
         return
     }
@@ -587,11 +774,11 @@ function Main {
 
     Write-Info 'Running bootstrap preflight checks...'
 
+    Test-RequiredFiles -RepoRoot $repoRoot
+
     $dotenvPath = Join-Path -Path $repoRoot -ChildPath '.env'
     $envVars = Get-DotEnvVariables -LiteralPath $dotenvPath
     Assert-RequiredDotEnvKeys -EnvVars $envVars
-
-    Test-RequiredFiles -RepoRoot $repoRoot
 
     Require-Command -Name 'docker' -Hint 'Install Docker and ensure it is on PATH.'
     Require-Command -Name 'abctl' -Hint 'Install Airbyte abctl and ensure it is on PATH.'
@@ -599,8 +786,26 @@ function Main {
     Test-DockerDaemon
     Test-DockerCompose
 
-    Start-CoreServices
-    Test-PostgresProvisioning
+    Start-FoundationServices
+    Wait-PostgresReady -TimeoutSeconds 120
+    Wait-ClickHouseReady -TimeoutSeconds 120
+
+    Test-PostgresPipelineRole
+    Assert-AirflowPostgresObjectsExist
+
+    Start-SchemaInitializationServices
+    Wait-ServiceCompleted -Service 'postgres-schema-init' -TimeoutSeconds 300
+    Wait-ServiceCompleted -Service 'clickhouse-schema-init' -TimeoutSeconds 300
+
+    Assert-PostgresLandingSchema
+    Assert-ClickHouseOlapSchema
+
+    Start-ApplicationServices
+
+    Test-PostgresAirflowMetadataRole
+    Wait-AirflowInitCompleted -TimeoutSeconds 600
+    Test-AirflowMetadataDbCheck -TimeoutSeconds 180
+
     Ensure-AirbyteRunning
     Invoke-HealthCheck
 
