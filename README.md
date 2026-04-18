@@ -19,7 +19,7 @@ Pipeline end-to-end: extracción (Yahoo / yfinance), landing en PostgreSQL, vali
 | dbt          | Target `dev` (Postgres) y `olap` (ClickHouse, solo `models/olap`) |
 | Python       | Extracción y cargas en tareas Airflow (`src/`) |
 
-Arquitectura y decisiones: [docs/architecture.md](docs/architecture.md). Mapeo de datos: [docs/data_mapping.md](docs/data_mapping.md).
+Arquitectura y decisiones: [docs/architecture.md](docs/architecture.md). Diagrama editable (draw.io): [docs/architecture_pipeline.drawio](docs/architecture_pipeline.drawio). Mapeo de datos: [docs/data_mapping.md](docs/data_mapping.md).
 
 ## Estructura del repositorio
 
