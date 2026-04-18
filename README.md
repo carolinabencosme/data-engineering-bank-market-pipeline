@@ -21,6 +21,8 @@ Pipeline end-to-end: extracción (Yahoo / yfinance), landing en PostgreSQL, vali
 
 Arquitectura y decisiones: [docs/architecture.md](docs/architecture.md). Diagrama editable (draw.io): [docs/architecture_pipeline.drawio](docs/architecture_pipeline.drawio). Mapeo de datos: [docs/data_mapping.md](docs/data_mapping.md).
 
+![Figura 1](./images/architecture_pipeline.drawio.png)
+
 ## Estructura del repositorio
 
 ```text
