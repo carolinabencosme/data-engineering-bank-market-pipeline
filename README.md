@@ -1,3 +1,5 @@
+[Video Guía para Correr el Proyecto en Windows](https://youtu.be/uE8KlKZuO2w)
+
 # data-engineering-bank-market-pipeline
 
 Pipeline end-to-end: extracción (Yahoo / yfinance), landing en PostgreSQL, validación y modelado con dbt, carga incremental a ClickHouse (staging + curated), mart mensual y orquestación con Airflow. Docker Compose para el núcleo; Airbyte local opcional vía `abctl` (no participa en la ruta activa de datos).
