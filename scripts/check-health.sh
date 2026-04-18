@@ -135,16 +135,45 @@ check_clickhouse() {
 }
 
 check_airflow_webserver() {
-  local result exit_code output
-  result="$(capture docker compose exec -T airflow-webserver curl --silent --show-error --fail http://localhost:8080/health)"
-  exit_code="$(printf '%s\n' "$result" | head -n1)"
-  output="$(printf '%s\n' "$result" | tail -n +2)"
+  # Webserver often listens after DB checks pass; wait by wall-clock budget, not a fixed attempt count.
+  # HEALTHCHECK_AIRFLOW_WEBSERVER_MAX_WAIT_SECONDS (default 1800), HEALTHCHECK_AIRFLOW_WEBSERVER_SLEEP_SECONDS (default 5).
+  local sleep_seconds="${HEALTHCHECK_AIRFLOW_WEBSERVER_SLEEP_SECONDS:-5}"
+  [[ "$sleep_seconds" =~ ^[1-9][0-9]*$ ]] || sleep_seconds=5
+  local max_wait="${HEALTHCHECK_AIRFLOW_WEBSERVER_MAX_WAIT_SECONDS:-1800}"
+  [[ "$max_wait" =~ ^[1-9][0-9]*$ ]] || max_wait=1800
 
-  if [[ "$exit_code" -eq 0 && "$output" == *healthy* ]]; then
-    mark_pass "airflow-webserver" "health endpoint healthy"
-  else
-    mark_fail "airflow-webserver" "health endpoint failed (${output//$'\n'/; })"
-  fi
+  local start_ts now_ts elapsed attempt last_result last_exit last_output summary
+  start_ts="$(date +%s)"
+  attempt=0
+
+  while true; do
+    attempt=$((attempt + 1))
+    last_result="$(capture docker compose exec -T airflow-webserver curl --silent --show-error --fail http://localhost:8080/health)"
+    last_exit="$(printf '%s\n' "$last_result" | head -n1)"
+    last_output="$(printf '%s\n' "$last_result" | tail -n +2)"
+
+    if [[ "$last_exit" -eq 0 && "$last_output" == *healthy* ]]; then
+      now_ts="$(date +%s)"
+      elapsed=$((now_ts - start_ts))
+      if [[ "$attempt" -eq 1 ]]; then
+        mark_pass "airflow-webserver" "health endpoint healthy"
+      else
+        mark_pass "airflow-webserver" "health endpoint healthy after ${attempt} polls (${elapsed}s)"
+      fi
+      return
+    fi
+
+    now_ts="$(date +%s)"
+    elapsed=$((now_ts - start_ts))
+    if (( elapsed >= max_wait )); then
+      break
+    fi
+    sleep "$sleep_seconds"
+  done
+
+  summary="$(printf '%s' "$last_output" | tr '\n' '; ' | head -c 240)"
+  [[ ${#summary} -eq 240 ]] && summary="${summary}..."
+  mark_fail "airflow-webserver" "health endpoint not healthy within ${max_wait}s (${attempt} polls; ${summary})"
 }
 
 check_airflow_scheduler() {

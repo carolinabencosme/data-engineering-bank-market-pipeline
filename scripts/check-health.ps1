@@ -1,7 +1,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$Summary = New-Object System.Collections.Generic.List[object]
+$script:HealthCheckResults = New-Object System.Collections.Generic.List[object]
 $CriticalFailures = 0
 
 # Servicios que sí deben permanecer corriendo
@@ -15,7 +15,7 @@ function Add-Result {
     )
 
     $status = if ($Passed) { 'PASS' } else { 'FAIL' }
-    $Summary.Add([PSCustomObject]@{
+    $script:HealthCheckResults.Add([PSCustomObject]@{
         Service = $Service
         Check   = $status
         Detail  = $Detail
@@ -201,16 +201,52 @@ function Test-ClickHouse {
 }
 
 function Test-AirflowWebserver {
-    $result = Invoke-Captured {
-        docker compose exec -T airflow-webserver curl --silent --show-error --fail http://localhost:8080/health
+    # Webserver often binds after `airflow db check` succeeds; a single curl races connection refused.
+    # Waits up to a wall-clock budget (default 30 min), polling every few seconds — not a fixed attempt count.
+    # HEALTHCHECK_AIRFLOW_WEBSERVER_MAX_WAIT_SECONDS (default 1800), HEALTHCHECK_AIRFLOW_WEBSERVER_SLEEP_SECONDS (default 5).
+    $sleepSeconds = 5
+    $rawSleep = $env:HEALTHCHECK_AIRFLOW_WEBSERVER_SLEEP_SECONDS
+    if ($rawSleep -match '^\d+$' -and [int]$rawSleep -gt 0) { $sleepSeconds = [int]$rawSleep }
+
+    $maxWaitSeconds = 1800
+    $rawWait = $env:HEALTHCHECK_AIRFLOW_WEBSERVER_MAX_WAIT_SECONDS
+    if ($rawWait -match '^\d+$' -and [int]$rawWait -gt 0) {
+        $maxWaitSeconds = [int]$rawWait
     }
 
-    if ($result.ExitCode -eq 0 -and $result.Output -match 'healthy') {
-        Add-Result -Service 'airflow-webserver' -Passed $true -Detail 'health endpoint healthy'
+    $start = Get-Date
+    $attempt = 0
+    $lastResult = $null
+
+    while ($true) {
+        $attempt++
+        $lastResult = Invoke-Captured {
+            docker compose exec -T airflow-webserver curl --silent --show-error --fail http://localhost:8080/health
+        }
+
+        if ($lastResult.ExitCode -eq 0 -and $lastResult.Output -match 'healthy') {
+            $elapsed = [int]((Get-Date) - $start).TotalSeconds
+            $detail = if ($attempt -eq 1) {
+                'health endpoint healthy'
+            }
+            else {
+                "health endpoint healthy after $attempt polls (${elapsed}s)"
+            }
+
+            Add-Result -Service 'airflow-webserver' -Passed $true -Detail $detail
+            return
+        }
+
+        $elapsed = ((Get-Date) - $start).TotalSeconds
+        if ($elapsed -ge $maxWaitSeconds) {
+            break
+        }
+
+        Start-Sleep -Seconds $sleepSeconds
     }
-    else {
-        Add-Result -Service 'airflow-webserver' -Passed $false -Detail "health endpoint failed ($($result.Output -replace "`r?`n", '; '))"
-    }
+
+    $summary = Get-SummarizedOutput -Text $lastResult.Output
+    Add-Result -Service 'airflow-webserver' -Passed $false -Detail "health endpoint not healthy within ${maxWaitSeconds}s ($attempt polls; $summary)"
 }
 
 function Test-AirflowScheduler {
@@ -293,7 +329,7 @@ Test-AirflowScheduler
 Test-Dbt
 Test-Airbyte
 
-$Summary | Format-Table -AutoSize
+$script:HealthCheckResults | Format-Table -AutoSize
 
 if ($CriticalFailures -gt 0) {
     exit 1
